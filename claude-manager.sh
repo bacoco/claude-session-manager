@@ -3,18 +3,15 @@
 # Claude Session Manager — Smart account swap
 # ═══════════════════════════════════════════════════════════
 #
-# REALITY: Claude Code uses a SLIDING WINDOW, not fixed blocks.
-# - Usage is tracked over the trailing 5 hours
-# - Old usage naturally "falls off" after 5h
-# - Pinging/renewing does NOTHING — it just adds more usage
+# SIMPLE ALGO:
+# - indien = preferred, always use it when available
+# - perso = safety net, only when indien is rate limited
+# - Monitor indien usage via local session files (zero API cost)
+# - At 95% usage → swap to perso
+# - Periodically check if indien is available again → swap back
+# - NEVER swap FROM perso based on usage (perso has no threshold)
 #
-# ALGO:
-# 1. Do NOTHING proactively — zero pings, zero renewals
-# 2. When user hits 429 → swap to fallback account
-# 3. Record WHEN the 429 happened
-# 4. Wait ~5h (sliding window clears) → check primary → swap back
-# 5. If fallback also 429 → wait, check periodically
-# 6. Never swap to a broken account
+# Claude uses a 5h SLIDING WINDOW. No pings, no renewals.
 # ═══════════════════════════════════════════════════════════
 
 set -u
@@ -27,10 +24,13 @@ PRIMARY_CREDS="$CREDS_DIR/.credentials-${PRIMARY_NAME}.json"
 FALLBACK_CREDS="$CREDS_DIR/.credentials-${FALLBACK_NAME}.json"
 LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
-RATE_LIMITED_AT="/tmp/claude-rate-limited-at"  # epoch when primary got 429
+RATE_LIMITED_AT="/tmp/claude-rate-limited-at"
 WINDOW_HOURS=5
-CHECK_INTERVAL=300   # 5 min between usage checks (reads local files, zero cost)
-SWAP_THRESHOLD=95    # Swap to fallback at this % usage
+CHECK_INTERVAL=300       # 5 min — read local files (zero cost)
+SWAP_THRESHOLD=95        # Swap indien→perso at this %
+RECOVERY_INTERVAL=1800   # 30 min — check indien via CLI when on perso (costs 1 token)
+MAX_FAILS=3
+LONG_RETRY=3600          # 1h after repeated failures
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 log() {
@@ -54,53 +54,50 @@ except: print('error')
 " 2>/dev/null
 }
 
-check_account() {
-    # Returns: 0=OK, 1=rate_limited, 2=broken/expired, 3=no_creds
-    # Uses claude CLI directly — it knows how to connect
-    local creds_file=$1
-    [ ! -f "$creds_file" ] && return 3
+get_usage_pct() {
+    # Read local session files — ZERO API COST
+    python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0"
+}
 
-    # Temporarily swap creds to test this account
+check_account_via_cli() {
+    # Returns: 0=OK, 1=rate_limited, 2=broken
+    # COSTS ~1 TOKEN — only call when needed
+    local creds_file=$1
+    [ ! -f "$creds_file" ] && return 2
+
+    # Temporarily swap creds to test
     local backup=$(mktemp)
     cp "$CREDS_FILE" "$backup" 2>/dev/null
     cp "$creds_file" "$CREDS_FILE"
 
-    # Minimal CLI call — costs ~1 token but 100% reliable
-    # Only called when deciding to swap, not in a tight loop
     local output
     output=$(echo "ok" | timeout 30 claude -p "reply with just OK" --max-turns 1 2>&1)
     local rc=$?
 
-    # Restore original creds
+    # Restore creds
     cp "$backup" "$CREDS_FILE" 2>/dev/null
     rm -f "$backup"
 
     if [ $rc -eq 0 ]; then
-        return 0  # Account works
+        return 0
     elif echo "$output" | grep -qi "rate.limit\|usage.limit\|429\|exceeded"; then
-        return 1  # Rate limited
+        return 1
     else
-        return 2  # Broken/expired/other error
+        return 2
     fi
 }
 
-swap_to() {
+do_swap() {
+    # Swap to target. Checks health first.
     local target_name=$1
     local target_creds="$CREDS_DIR/.credentials-${target_name}.json"
 
-    # Check target health BEFORE swapping
-    check_account "$target_creds"
-    local rc=$?
-    if [ $rc -eq 2 ] || [ $rc -eq 3 ]; then
-        log "ABORT: $target_name is broken/missing (rc=$rc)"
-        return 1
-    fi
-    if [ $rc -eq 1 ]; then
-        log "ABORT: $target_name is also rate limited"
+    if [ ! -f "$target_creds" ]; then
+        log "ABORT: no credentials for $target_name"
         return 1
     fi
 
-    # Save current creds
+    # Save current
     local current=$(get_current_account)
     if [ "$current" != "unknown" ] && [ "$current" != "error" ]; then
         cp "$CREDS_FILE" "$CREDS_DIR/.credentials-${current}.json" 2>/dev/null
@@ -112,133 +109,129 @@ swap_to() {
     return 0
 }
 
-# ── Main ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 
 log "=== Claude Session Manager started ==="
 
-# Detect mode
-DUAL_MODE=false
-if [ -f "$PRIMARY_CREDS" ] && [ -f "$FALLBACK_CREDS" ]; then
-    DUAL_MODE=true
-    log "DUAL MODE: primary=$PRIMARY_NAME, fallback=$FALLBACK_NAME"
-else
-    log "SINGLE MODE: no swap, monitoring only"
+# Check mode
+if [ ! -f "$PRIMARY_CREDS" ] || [ ! -f "$FALLBACK_CREDS" ]; then
+    log "SINGLE MODE — need 2 credential files for auto-swap"
+    log "  Save creds: /account save indien  +  /account save perso"
+    while true; do sleep 3600; done
 fi
 
-# If single mode, just monitor and log — nothing else to do
-if [ "$DUAL_MODE" = false ]; then
-    log "Nothing to manage in single mode. Exiting."
-    log "To enable swap: save creds for 2 accounts via /account save <name>"
-    # Stay alive but idle — systemd expects the process to run
-    while true; do
-        sleep 3600
-    done
-fi
+log "DUAL MODE: primary=$PRIMARY_NAME (preferred), fallback=$FALLBACK_NAME (safety net)"
 
-# Dual mode: ensure we start on primary if possible
-check_account "$PRIMARY_CREDS"
-primary_status=$?
-if [ $primary_status -eq 0 ]; then
-    swap_to "$PRIMARY_NAME" || true
+# Start: try indien first
+check_account_via_cli "$PRIMARY_CREDS"
+rc=$?
+if [ $rc -eq 0 ]; then
+    do_swap "$PRIMARY_NAME"
     log "Started on $PRIMARY_NAME"
-elif [ $primary_status -eq 1 ]; then
-    log "$PRIMARY_NAME is rate limited at startup"
+elif [ $rc -eq 1 ]; then
+    log "$PRIMARY_NAME rate limited at startup, using $FALLBACK_NAME"
     date +%s > "$RATE_LIMITED_AT"
-    swap_to "$FALLBACK_NAME" || log "Fallback also unavailable"
+    do_swap "$FALLBACK_NAME"
 else
-    log "$PRIMARY_NAME is broken/missing, trying $FALLBACK_NAME"
-    swap_to "$FALLBACK_NAME" || log "Both accounts unavailable"
+    log "$PRIMARY_NAME broken, using $FALLBACK_NAME"
+    do_swap "$FALLBACK_NAME"
 fi
 
-primary_fail_count=0
-MAX_FAILS=3
-LONG_RETRY=1800  # 30 min
+fail_count=0
+
+# ═══════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════
 
 while true; do
     current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
     if [ "$current" = "$PRIMARY_NAME" ]; then
-        # ═══ ON PRIMARY — monitor usage via local session files (zero API cost) ═══
-        usage_pct=$(python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0")
+        # ─── ON INDIEN ───────────────────────────────────
+        # Monitor usage by reading local files (FREE)
+        # If usage >= 95% → swap to perso
+        # If manual swap requested → swap to perso
 
+        usage=$(get_usage_pct)
+
+        # Manual swap request
         if [ -f "/tmp/claude-request-swap" ]; then
-            # Manual swap requested
             rm -f "/tmp/claude-request-swap"
-            log "Manual swap requested!"
+            log "Manual swap requested (usage: ${usage}%)"
             date +%s > "$RATE_LIMITED_AT"
-            swap_to "$FALLBACK_NAME" && log "Swapped to $FALLBACK_NAME" || log "$FALLBACK_NAME unavailable"
-        elif [ "$(echo "$usage_pct >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-            # Usage threshold exceeded — auto-swap!
-            log "USAGE ${usage_pct}% >= ${SWAP_THRESHOLD}%! Auto-swapping to $FALLBACK_NAME..."
+            do_swap "$FALLBACK_NAME"
+        # Usage threshold
+        elif [ "$(echo "$usage >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+            log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — swapping to $FALLBACK_NAME"
             date +%s > "$RATE_LIMITED_AT"
-            swap_to "$FALLBACK_NAME" && log "Auto-swapped to $FALLBACK_NAME (usage was ${usage_pct}%)" || log "$FALLBACK_NAME unavailable"
-        else
-            # Log usage periodically (every 30 min)
-            if [ $(($(date +%s) % 1800)) -lt "$CHECK_INTERVAL" ]; then
-                log "Usage: ${usage_pct}% (threshold: ${SWAP_THRESHOLD}%)"
-            fi
+            do_swap "$FALLBACK_NAME"
         fi
+
         sleep "$CHECK_INTERVAL"
 
     elif [ "$current" = "$FALLBACK_NAME" ]; then
-        # ═══ ON FALLBACK — wait for primary to clear ═══
+        # ─── ON PERSO ────────────────────────────────────
+        # Wait for indien to become available again
+        # Strategy:
+        #   1. If we know when indien was limited → sleep until clear time
+        #   2. Then check indien via CLI (costs 1 token)
+        #   3. If OK → swap back to indien
+        #   4. If still limited → wait 30 more minutes
+        #   5. If broken → wait longer (1h)
+
         now=$(date +%s)
 
-        # Calculate how long to wait
+        # Calculate when indien should be clear
         if [ -f "$RATE_LIMITED_AT" ]; then
             limited_at=$(cat "$RATE_LIMITED_AT")
             clear_at=$((limited_at + WINDOW_HOURS * 3600))
             remaining=$((clear_at - now))
 
             if [ $remaining -gt 0 ]; then
-                # Still in the window — sleep until clear time
-                log "Waiting ${remaining}s for $PRIMARY_NAME sliding window to clear ($(date -d @$clear_at '+%H:%M' 2>/dev/null || echo 'soon'))"
+                log "Sleeping ${remaining}s until $PRIMARY_NAME window clears (~$(date -d @$clear_at '+%H:%M' 2>/dev/null || echo "${remaining}s"))"
                 sleep $remaining
-                continue  # Go straight to the check below
+                continue
             fi
         fi
 
-        # Window should be clear — try primary
-        retry_interval=$CHECK_INTERVAL
-        [ $primary_fail_count -ge $MAX_FAILS ] && retry_interval=$LONG_RETRY
-
-        check_account "$PRIMARY_CREDS"
+        # Window should be clear — test indien (costs 1 token)
+        log "Testing $PRIMARY_NAME..."
+        check_account_via_cli "$PRIMARY_CREDS"
         rc=$?
+
         if [ $rc -eq 0 ]; then
-            # Primary is back!
-            if swap_to "$PRIMARY_NAME"; then
-                log "Back on $PRIMARY_NAME!"
-                primary_fail_count=0
-                rm -f "$RATE_LIMITED_AT"
-            fi
+            do_swap "$PRIMARY_NAME"
+            log "Back on $PRIMARY_NAME!"
+            fail_count=0
+            rm -f "$RATE_LIMITED_AT"
         elif [ $rc -eq 1 ]; then
-            # Still rate limited — the window hasn't fully cleared
-            # This means heavy usage, extend wait by 30 min
-            log "$PRIMARY_NAME still rate limited, extending wait 30min"
-            date +%s > "$RATE_LIMITED_AT"  # reset the timer
-            sleep 1800
+            log "$PRIMARY_NAME still limited, waiting ${RECOVERY_INTERVAL}s"
+            # Reset timer — still in the window
+            date +%s > "$RATE_LIMITED_AT"
+            sleep "$RECOVERY_INTERVAL"
             continue
         else
-            # Broken
-            primary_fail_count=$((primary_fail_count + 1))
-            log "$PRIMARY_NAME still broken (fail #$primary_fail_count), retry in ${retry_interval}s"
+            fail_count=$((fail_count + 1))
+            retry=$RECOVERY_INTERVAL
+            [ $fail_count -ge $MAX_FAILS ] && retry=$LONG_RETRY
+            log "$PRIMARY_NAME broken (fail #$fail_count), retry in ${retry}s"
+            sleep "$retry"
+            continue
         fi
 
-        # Also check if fallback is still OK
-        check_account "$FALLBACK_CREDS"
-        frc=$?
-        if [ $frc -eq 1 ]; then
-            log "$FALLBACK_NAME also rate limited now!"
-            # Both limited — check if primary cleared
-            check_account "$PRIMARY_CREDS"
-            [ $? -eq 0 ] && swap_to "$PRIMARY_NAME" && log "Emergency swap back to $PRIMARY_NAME"
-        fi
+        sleep "$RECOVERY_INTERVAL"
 
-        sleep "$retry_interval"
     else
-        # Unknown state — try to recover
-        log "Unknown state '$current', attempting recovery..."
-        swap_to "$PRIMARY_NAME" || swap_to "$FALLBACK_NAME" || true
+        # Unknown state — recover
+        log "Unknown state, trying $PRIMARY_NAME..."
+        check_account_via_cli "$PRIMARY_CREDS"
+        if [ $? -eq 0 ]; then
+            do_swap "$PRIMARY_NAME"
+        else
+            do_swap "$FALLBACK_NAME" 2>/dev/null
+        fi
         sleep "$CHECK_INTERVAL"
     fi
 done

@@ -1,36 +1,164 @@
 # Claude Session Manager
 
-Lightweight daemon that keeps your Claude Code sessions alive and automatically manages multiple accounts.
+Daemon that monitors your Claude Code usage and automatically swaps between accounts before you hit rate limits.
 
-## The Problem
+## How Claude Code Limits Work
 
-Claude Code uses a **sliding window**: your usage over the trailing 5 hours is tracked. When it exceeds the threshold, you get 429 rate limited. Old usage naturally falls off after 5h. There's nothing to "renew" or "ping" — you just have to wait.
+Claude Code uses a **5-hour sliding window**. Every API call consumes tokens. Your usage is the sum of all tokens in the last 5 hours. When it exceeds your plan's threshold, you get rate limited (429). Old tokens naturally "fall off" as they age past 5h. There's nothing to "renew" — you just wait.
 
-If you have two accounts, you can swap to the other one while waiting. That's what this tool does.
+## What This Tool Does
 
-## What This Does
+It reads your local Claude Code session files to track token usage in real time (zero API cost), and swaps to a backup account before you get rate limited.
 
-### Single Account (default)
-Monitors your account. Logs when you get rate limited and estimates when it clears. That's it — there's nothing to "renew" with a sliding window.
+## Setup Modes
 
-### Dual Account (the real value)
-If you configure two accounts (e.g. work + personal):
-- Uses your **primary account** by default
-- When primary gets 429 → checks fallback is healthy → **swaps immediately**
-- Records when the 429 happened → calculates when the sliding window clears (now + 5h)
-- **Sleeps until clear time** (no polling waste)
-- At clear time → checks primary → swaps back
-- If primary is still limited (heavy usage) → extends wait 30min
-- Never swaps to a broken account (expired token, 401, network error)
-- If both accounts 429 → stays put, waits for whichever clears first
+### Mode 1: No credentials saved → does nothing
 
-### Safety
-- **Checks before every swap**: target must be healthy (200) before copying credentials
-- **Backoff on broken accounts**: 3 failures → 30min retry interval
-- **Survives reboots**: systemd service, auto-restart on crash
-- **Minimal resource usage**: sleeps most of the time. One `curl` check (~10ms) only when needed
+```
+~/.claude/.credentials-*.json  →  none exist
+```
 
-## Quick Start
+The daemon starts, logs "SINGLE MODE", and sleeps forever. No monitoring, no swap. Claude Code works normally.
+
+### Mode 2: One credential saved → usage monitoring only
+
+```
+~/.claude/.credentials-indien.json  →  exists
+~/.claude/.credentials-perso.json   →  does NOT exist
+```
+
+Same as Mode 1. Can't swap with only one account. Logs usage for information.
+
+### Mode 3: Two credentials saved → full auto-swap
+
+```
+~/.claude/.credentials-indien.json  →  exists
+~/.claude/.credentials-perso.json   →  exists
+```
+
+This is the real deal. Full algorithm below.
+
+## Algorithm (Mode 3 — Dual Account)
+
+```
+                         START
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Test PRIMARY account  │
+              │  (claude -p "OK")      │
+              │  Costs 1 token         │
+              └───────────┬────────────┘
+                          │
+              ┌───────────┼───────────┐
+              ▼           ▼           ▼
+            200 OK      429         401/err
+              │      rate limited    broken
+              │           │           │
+              ▼           │           ▼
+     ┌────────────┐       │    ┌────────────────┐
+     │ USE PRIMARY │       │    │ Test FALLBACK   │
+     └─────┬──────┘       │    │ (claude -p "OK") │
+           │              │    └───────┬────────┘
+           ▼              │            │
+   ┌───────────────┐      │     ┌──────┼──────┐
+   │ Every 5 min:  │      │     ▼      ▼      ▼
+   │ read local    │      │   200 OK  429   broken
+   │ session files │      │     │      │      │
+   │ (zero cost)   │      │     ▼      │      ▼
+   └──────┬────────┘      │  USE IT    │   BOTH DOWN
+          │               │            │   sleep 30min
+          ▼               │            │   retry
+   ┌──────────────┐       │            │
+   │ usage < 95%  │       │            │
+   │ → keep going │       │            │
+   │              │       │            │
+   │ usage >= 95% │───────┘            │
+   │ → SWAP!      │                    │
+   └──────────────┘                    │
+                                       │
+              ┌────────────────────────┘
+              ▼
+     ┌─────────────────────────────────────┐
+     │         SWAP TO FALLBACK            │
+     │                                     │
+     │  1. Test fallback (claude -p "OK")  │
+     │     - If broken → ABORT, stay put   │
+     │     - If 429 → ABORT, stay put      │
+     │     - If OK → continue              │
+     │                                     │
+     │  2. Save current creds              │
+     │     cp .credentials.json            │
+     │        → .credentials-PRIMARY.json  │
+     │                                     │
+     │  3. Activate fallback               │
+     │     cp .credentials-FALLBACK.json   │
+     │        → .credentials.json          │
+     │                                     │
+     │  4. Record swap time                │
+     │     echo $(date +%s) > /tmp/...     │
+     └─────────────────┬───────────────────┘
+                       │
+                       ▼
+     ┌─────────────────────────────────────┐
+     │       ON FALLBACK — WAITING         │
+     │                                     │
+     │  Calculate: primary clears at       │
+     │  = swap_time + 5 hours              │
+     │                                     │
+     │  SLEEP until that exact time        │
+     │  (no polling, no wasted cycles)     │
+     │                                     │
+     └─────────────────┬───────────────────┘
+                       │
+                       ▼  (5h later)
+     ┌─────────────────────────────────────┐
+     │    Test PRIMARY (claude -p "OK")    │
+     │    Costs 1 token                    │
+     └─────────────────┬───────────────────┘
+                       │
+              ┌────────┼────────┐
+              ▼        ▼        ▼
+           200 OK    429     broken
+              │    still      │
+              │    limited    │
+              ▼        │      ▼
+     ┌────────────┐    │   extend wait
+     │ SWAP BACK  │    │   +30 min
+     │ to PRIMARY │    │   then retry
+     └────────────┘    └──→ ...
+```
+
+## Configuration
+
+### Environment Variables (set in systemd service file)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_PRIMARY_ACCOUNT` | `indien` | Primary account name |
+| `CLAUDE_FALLBACK_ACCOUNT` | `perso` | Fallback account name |
+| `CLAUDE_TOKEN_BUDGET` | `5000000` | Estimated 5h token budget |
+| `CLAUDE_SWAP_THRESHOLD` | `95` | Swap at this usage % |
+
+### Script Constants (in claude-manager.sh)
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CHECK_INTERVAL` | `300` (5min) | How often to read local usage files |
+| `WINDOW_HOURS` | `5` | Sliding window duration |
+| `SWAP_THRESHOLD` | `95` | Auto-swap trigger (%) |
+| `MAX_FAILS` | `3` | Consecutive check_account failures before long backoff |
+| `LONG_RETRY` | `1800` (30min) | Retry interval after repeated failures |
+
+## What Each Check Costs
+
+| Action | Token Cost | When |
+|--------|:----------:|------|
+| Read local session files | **0** | Every 5 min while on primary |
+| `claude -p "OK"` (health check) | **~1 token** | Only at startup + when trying to swap back |
+| Sleep | **0** | Most of the time on fallback |
+
+## Install
 
 ```bash
 git clone https://github.com/bacoco/claude-session-manager.git
@@ -39,165 +167,62 @@ chmod +x install.sh
 ./install.sh
 ```
 
-This installs:
-- `claude-manager` systemd user service (starts at boot, auto-restarts on crash)
-- `/account` slash command in Claude Code
-- `/swap` slash command in Claude Code
-
-### That's it for single account mode. It just works.
-
-### Optional: Enable dual account swap
-
-Save credentials for both accounts:
+## Save Account Credentials
 
 ```bash
-# Login to your primary account
-claude login
-# Then in Claude Code:
-/account save work
+# Login to primary account, then in Claude Code:
+/account save indien
 
-# Login to your fallback account
-claude login
-# Then in Claude Code:
-/account save personal
-```
-
-Configure account names (default: `indien` / `perso`):
-
-```bash
-# In your ~/.config/systemd/user/claude-manager.service, add:
-Environment=CLAUDE_PRIMARY_ACCOUNT=work
-Environment=CLAUDE_FALLBACK_ACCOUNT=personal
-```
-
-## How It Works
-
-```
-                    ┌──────────────┐
-                    │  Start       │
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Only 1 acct? ├──YES──► Session renewal only
-                    └──────┬───────┘        (ping every 5h)
-                           │ NO
-                    ┌──────▼───────┐
-                    │ Primary OK?  ├──YES──► Use primary
-                    └──────┬───────┘        Check every 5min
-                           │ NO
-                    ┌──────▼───────┐
-                    │ Rate limited │
-                    │ or broken?   │
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Fallback OK? ├──NO──► Stay put, wait
-                    └──────┬───────┘
-                           │ YES
-                    ┌──────▼───────┐
-                    │ Swap to      │
-                    │ fallback     │
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────────────┐
-                    │ Calculate reset time  │
-                    │ = now + 5 hours       │
-                    └──────┬───────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │ SLEEP until  │  ◄── no polling!
-                    │ reset time   │
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Primary OK?  ├──YES──► Swap back
-                    └──────┬───────┘
-                           │ NO
-                           └──► Extend wait 30min, retry
+# Login to fallback account, then in Claude Code:
+/account save perso
 ```
 
 ## Commands
 
-### System
-
 ```bash
-systemctl --user status claude-manager     # daemon status
-systemctl --user restart claude-manager    # restart
-systemctl --user stop claude-manager       # stop
-tail -f ~/.claude-manager.log              # live logs
-cat /tmp/claude-account-state              # current account
+# Service
+systemctl --user status claude-manager
+systemctl --user restart claude-manager
+tail -f ~/.claude-manager.log
+
+# In Claude Code
+/account              # show usage + status
+/account swap         # manual swap
+/account swap indien  # force specific account
+/account save myname  # save current creds
+
+# Force swap from terminal (no Claude Code needed)
+touch /tmp/claude-request-swap
 ```
-
-### In Claude Code
-
-```bash
-/account                # show status of all accounts + daemon
-/account swap           # toggle to other account
-/account swap work      # force specific account
-/account renew          # force new 5h block now
-/account save myname    # save current creds as "myname"
-/account fallback       # show alternative AI tools if both accounts dead
-
-/swap                   # quick toggle (legacy, still works)
-/swap status            # show active account
-```
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_PRIMARY_ACCOUNT` | `indien` | Name of preferred account |
-| `CLAUDE_FALLBACK_ACCOUNT` | `perso` | Name of fallback account |
-
-### Tunable Constants (in claude-manager.sh)
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `BLOCK_HOURS` | `5` | Claude's rolling window duration |
-| `CHECK_INTERVAL` | `300` | Seconds between health checks (5min) |
-| `MAX_INDIEN_FAILS` | `3` | Consecutive failures before long backoff |
-| `LONG_RETRY` | `1800` | Seconds to wait after repeated failures (30min) |
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `claude-manager.sh` | Main daemon — handles swap + renewal |
-| `claude-manager.service` | systemd unit — auto-start, auto-restart |
-| `account.md` | `/account` slash command for Claude Code |
-| `swap.md` | `/swap` slash command (legacy, still works) |
-| `install.sh` | One-command install |
-| `uninstall.sh` | Clean uninstall |
-
-## Credential Files
-
-Stored in `~/.claude/`:
-
-| File | Created by |
-|------|------------|
-| `.credentials.json` | Claude Code (active account) |
-| `.credentials-<name>.json` | `/account save <name>` |
-
-The daemon copies between these files to swap accounts. No tokens are stored in the repo.
+| `claude-manager.sh` | Main daemon |
+| `check-usage.py` | Reads local JSONL files, returns usage % |
+| `claude-manager.service` | systemd unit |
+| `account.md` | `/account` slash command |
+| `swap.md` | `/swap` slash command (legacy) |
+| `install.sh` | Install script |
+| `uninstall.sh` | Uninstall script |
 
 ## FAQ
 
-**Q: I only have one account. Does this do anything?**
-Not much. It monitors and logs when you get rate limited. The real value is dual-account swap.
+**Q: Does monitoring consume my Claude usage?**
+No. `check-usage.py` reads local files on disk. Zero API calls.
+
+**Q: What about the health check?**
+`check_account` runs `claude -p "OK"` which costs ~1 token. It only runs at startup and when checking if the primary account is available again after being rate limited. Not in a loop.
 
 **Q: What if both accounts are dead?**
-The daemon waits. It calculates when the primary resets and sleeps until then. No wasted CPU.
+The daemon stays on whichever was last working and retries every 30 minutes.
 
-**Q: Does this consume Claude usage?**
-No. Health checks use `curl` against the auth endpoint — zero token consumption. No pings, no messages sent.
+**Q: What if I only have one account?**
+The daemon does nothing. No monitoring, no overhead.
 
-**Q: What if a token expires?**
-The daemon detects 401/403, marks the account as broken, and stays on the working account. Run `claude login` + `/account save <name>` to refresh.
-
-**Q: Can I add more than 2 accounts?**
-Not currently. The daemon handles primary + fallback. PRs welcome.
+**Q: Is CLAUDE_TOKEN_BUDGET accurate?**
+No. Anthropic doesn't publish exact limits. 5M is a community estimate for Max plans. Adjust if you find a better number.
 
 ## License
 

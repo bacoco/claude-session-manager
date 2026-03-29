@@ -29,7 +29,9 @@ LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
 RATE_LIMITED_AT="/tmp/claude-rate-limited-at"  # epoch when primary got 429
 WINDOW_HOURS=5
-CHECK_INTERVAL=1800  # 30 min between checks (each check costs ~1 token via CLI)
+CHECK_INTERVAL=300   # 5 min between usage checks (reads local files, zero cost)
+SWAP_THRESHOLD=95    # Swap to fallback at this % usage
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
@@ -156,16 +158,25 @@ while true; do
     current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
     if [ "$current" = "$PRIMARY_NAME" ]; then
-        # ═══ ON PRIMARY — do nothing, user is working ═══
-        # The daemon doesn't need to monitor primary actively.
-        # If user gets 429, they use /account swap or the daemon
-        # can be notified via a signal/file.
-        # Just sleep and check occasionally if a swap was requested.
+        # ═══ ON PRIMARY — monitor usage via local session files (zero API cost) ═══
+        usage_pct=$(python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0")
+
         if [ -f "/tmp/claude-request-swap" ]; then
+            # Manual swap requested
             rm -f "/tmp/claude-request-swap"
-            log "Swap requested! Checking $FALLBACK_NAME..."
+            log "Manual swap requested!"
             date +%s > "$RATE_LIMITED_AT"
             swap_to "$FALLBACK_NAME" && log "Swapped to $FALLBACK_NAME" || log "$FALLBACK_NAME unavailable"
+        elif [ "$(echo "$usage_pct >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+            # Usage threshold exceeded — auto-swap!
+            log "USAGE ${usage_pct}% >= ${SWAP_THRESHOLD}%! Auto-swapping to $FALLBACK_NAME..."
+            date +%s > "$RATE_LIMITED_AT"
+            swap_to "$FALLBACK_NAME" && log "Auto-swapped to $FALLBACK_NAME (usage was ${usage_pct}%)" || log "$FALLBACK_NAME unavailable"
+        else
+            # Log usage periodically (every 30 min)
+            if [ $(($(date +%s) % 1800)) -lt "$CHECK_INTERVAL" ]; then
+                log "Usage: ${usage_pct}% (threshold: ${SWAP_THRESHOLD}%)"
+            fi
         fi
         sleep "$CHECK_INTERVAL"
 

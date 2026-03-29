@@ -1,34 +1,35 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# Claude Account Manager — Unified session renewal + account swap
+# Claude Session Manager — Smart account swap
 # ═══════════════════════════════════════════════════════════
 #
-# ALGO SIMPLE:
-# 1. On est sur indien par defaut
-# 2. On track l'heure du dernier message (via inotify sur history.jsonl)
-# 3. Si 5h ecoulees depuis premier message du bloc → envoyer ping pour renouveler
-# 4. Si on recoit un 429 → swap vers perso
-# 5. Calcul du reset = heure du premier message + 5h → on sait EXACTEMENT quand revenir
-# 6. A l'heure du reset → swap back indien
-# 7. Si un compte est broken → rester sur l'autre, pas de boucle
+# REALITY: Claude Code uses a SLIDING WINDOW, not fixed blocks.
+# - Usage is tracked over the trailing 5 hours
+# - Old usage naturally "falls off" after 5h
+# - Pinging/renewing does NOTHING — it just adds more usage
 #
-# COUT: quasi zero — pas de polling API, juste inotify + timers
+# ALGO:
+# 1. Do NOTHING proactively — zero pings, zero renewals
+# 2. When user hits 429 → swap to fallback account
+# 3. Record WHEN the 429 happened
+# 4. Wait ~5h (sliding window clears) → check primary → swap back
+# 5. If fallback also 429 → wait, check periodically
+# 6. Never swap to a broken account
 # ═══════════════════════════════════════════════════════════
 
 set -euo pipefail
 
 CREDS_DIR="$HOME/.claude"
 CREDS_FILE="$CREDS_DIR/.credentials.json"
-# Account names — configurable via env vars
 PRIMARY_NAME="${CLAUDE_PRIMARY_ACCOUNT:-indien}"
 FALLBACK_NAME="${CLAUDE_FALLBACK_ACCOUNT:-perso}"
-INDIEN="$CREDS_DIR/.credentials-${PRIMARY_NAME}.json"
-PERSO="$CREDS_DIR/.credentials-${FALLBACK_NAME}.json"
+PRIMARY_CREDS="$CREDS_DIR/.credentials-${PRIMARY_NAME}.json"
+FALLBACK_CREDS="$CREDS_DIR/.credentials-${FALLBACK_NAME}.json"
 LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
-BLOCK_START_FILE="/tmp/claude-block-start"
-BLOCK_HOURS=5
-CHECK_INTERVAL=300  # 5 min — only used as fallback, main trigger is timer-based
+RATE_LIMITED_AT="/tmp/claude-rate-limited-at"  # epoch when primary got 429
+WINDOW_HOURS=5
+CHECK_INTERVAL=300  # 5 min between checks when on fallback
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
@@ -41,220 +42,196 @@ import json
 try:
     d = json.load(open('$CREDS_FILE'))
     token = d.get('claudeAiOauth', {}).get('accessToken', '')[:30]
-    try:
-        it = json.load(open('$INDIEN')).get('claudeAiOauth', {}).get('accessToken', '')[:30]
-        if token == it: print('indien'); exit()
-    except: pass
-    try:
-        pt = json.load(open('$PERSO')).get('claudeAiOauth', {}).get('accessToken', '')[:30]
-        if token == pt: print('perso'); exit()
-    except: pass
-    tier = d.get('claudeAiOauth', {}).get('rateLimitTier', '')
-    if 'max_5x' in tier: print('indien')
-    elif 'max_20x' in tier: print('perso')
-    else: print('unknown')
+    for name in ['$PRIMARY_NAME', '$FALLBACK_NAME']:
+        try:
+            t = json.load(open(f'$CREDS_DIR/.credentials-{name}.json')).get('claudeAiOauth', {}).get('accessToken', '')[:30]
+            if token == t: print(name); exit()
+        except: pass
+    print('unknown')
 except: print('error')
 " 2>/dev/null
 }
 
-is_account_healthy() {
+check_account() {
+    # Returns: 0=OK, 1=rate_limited, 2=broken/expired, 3=no_creds
     local creds_file=$1
-    [ ! -f "$creds_file" ] && return 1
-    
-    local token=$(python3 -c "
-import json
-try: print(json.load(open('$creds_file')).get('claudeAiOauth', {}).get('accessToken', ''))
-except: print('')
-" 2>/dev/null)
-    
-    [ -z "$token" ] && return 1
-    
-    local status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-        -H "Authorization: Bearer $token" \
-        "https://api.claude.ai/api/auth/session" 2>/dev/null)
-    
-    # 200 = OK, 429 = rate limited but account works
-    [ "$status" = "200" ] || [ "$status" = "429" ]
-}
+    [ ! -f "$creds_file" ] && return 3
 
-is_rate_limited() {
-    local creds_file=${1:-$CREDS_FILE}
     local token=$(python3 -c "
 import json
-try: print(json.load(open('$creds_file')).get('claudeAiOauth', {}).get('accessToken', ''))
+try: print(json.load(open('$creds_file')).get('claudeAiOauth',{}).get('accessToken',''))
 except: print('')
 " 2>/dev/null)
-    
-    [ -z "$token" ] && return 2  # broken
-    
+
+    [ -z "$token" ] && return 2
+
     local status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
         -H "Authorization: Bearer $token" \
         "https://api.claude.ai/api/auth/session" 2>/dev/null)
-    
+
     case "$status" in
-        429) return 0 ;;  # rate limited
-        200) return 1 ;;  # OK
-        *)   return 2 ;;  # broken/network
+        200) return 0 ;;
+        429) return 1 ;;
+        401|403) return 2 ;;
+        *) return 2 ;;  # network error or unknown
     esac
 }
 
 swap_to() {
-    local target=$1
-    local target_file
-    [ "$target" = "indien" ] && target_file="$INDIEN" || target_file="$PERSO"
-    
-    # Check target is healthy BEFORE swapping
-    if ! is_account_healthy "$target_file"; then
-        log "ABORT swap to $target — account unhealthy"
+    local target_name=$1
+    local target_creds="$CREDS_DIR/.credentials-${target_name}.json"
+
+    # Check target health BEFORE swapping
+    check_account "$target_creds"
+    local rc=$?
+    if [ $rc -eq 2 ] || [ $rc -eq 3 ]; then
+        log "ABORT: $target_name is broken/missing (rc=$rc)"
         return 1
     fi
-    
+    if [ $rc -eq 1 ]; then
+        log "ABORT: $target_name is also rate limited"
+        return 1
+    fi
+
     # Save current creds
     local current=$(get_current_account)
-    if [ "$current" = "indien" ]; then
-        cp "$CREDS_FILE" "$INDIEN"
-    elif [ "$current" = "perso" ]; then
-        cp "$CREDS_FILE" "$PERSO"
+    if [ "$current" != "unknown" ] && [ "$current" != "error" ]; then
+        cp "$CREDS_FILE" "$CREDS_DIR/.credentials-${current}.json" 2>/dev/null
     fi
-    
-    cp "$target_file" "$CREDS_FILE"
-    echo "$target" > "$STATE_FILE"
-    log "SWAP: $current → $target"
+
+    cp "$target_creds" "$CREDS_FILE"
+    echo "$target_name" > "$STATE_FILE"
+    log "SWAP: $current -> $target_name"
     return 0
-}
-
-renew_session() {
-    # Send minimal message to start a new 5h block
-    local account=$1
-    log "RENEW: Pinging $account to start new 5h block..."
-    echo "hi" | timeout 30 claude --no-input 2>/dev/null || true
-    date +%s > "$BLOCK_START_FILE"
-    log "RENEW: New block started for $account at $(date)"
-}
-
-get_block_reset_time() {
-    # Returns epoch time when current block resets (block_start + 5h)
-    if [ -f "$BLOCK_START_FILE" ]; then
-        local start=$(cat "$BLOCK_START_FILE")
-        echo $((start + BLOCK_HOURS * 3600))
-    else
-        echo 0
-    fi
 }
 
 # ── Main ───────────────────────────────────────────────────
 
-log "=== Claude Manager started ==="
+log "=== Claude Session Manager started ==="
 
-# Detect mode: dual-account or single-account
-DUAL_MODE=true
-if [ ! -f "$INDIEN" ] || [ ! -f "$PERSO" ]; then
-    DUAL_MODE=false
-    log "SINGLE ACCOUNT MODE (only session renewal, no swap)"
-    log "To enable swap: save creds for both accounts via /swap save"
+# Detect mode
+DUAL_MODE=false
+if [ -f "$PRIMARY_CREDS" ] && [ -f "$FALLBACK_CREDS" ]; then
+    DUAL_MODE=true
+    log "DUAL MODE: primary=$PRIMARY_NAME, fallback=$FALLBACK_NAME"
 else
-    log "DUAL ACCOUNT MODE: Preferred=$PRIMARY_NAME | Fallback=$FALLBACK_NAME"
+    log "SINGLE MODE: no swap, monitoring only"
 fi
 
-# Determine starting account
+# If single mode, just monitor and log — nothing else to do
 if [ "$DUAL_MODE" = false ]; then
-    current=$(get_current_account)
-    echo "$current" > "$STATE_FILE"
-    log "Started on $current (single mode)"
-elif is_account_healthy "$INDIEN" && ! is_rate_limited "$INDIEN"; then
-    swap_to indien || swap_to perso || log "WARNING: No healthy account!"
-    log "Started on $PRIMARY_NAME"
-elif is_account_healthy "$PERSO"; then
-    swap_to perso
-    log "$PRIMARY_NAME unavailable, started on $FALLBACK_NAME"
-    # If indien is rate limited, estimate when it resets
-    if is_rate_limited "$INDIEN"; then
-        # Assume current block started ~2.5h ago (worst case middle of block)
-        echo $(($(date +%s) + BLOCK_HOURS * 1800)) > "$BLOCK_START_FILE"
-        log "Indien rate limited — estimated reset in ~2.5h"
-    fi
-else
-    log "WARNING: Both accounts unhealthy! Staying on current"
+    log "Nothing to manage in single mode. Exiting."
+    log "To enable swap: save creds for 2 accounts via /account save <name>"
+    # Stay alive but idle — systemd expects the process to run
+    while true; do
+        sleep 3600
+    done
 fi
 
-indien_broken=false
+# Dual mode: ensure we start on primary if possible
+check_account "$PRIMARY_CREDS"
+primary_status=$?
+if [ $primary_status -eq 0 ]; then
+    swap_to "$PRIMARY_NAME" || true
+    log "Started on $PRIMARY_NAME"
+elif [ $primary_status -eq 1 ]; then
+    log "$PRIMARY_NAME is rate limited at startup"
+    date +%s > "$RATE_LIMITED_AT"
+    swap_to "$FALLBACK_NAME" || log "Fallback also unavailable"
+else
+    log "$PRIMARY_NAME is broken/missing, trying $FALLBACK_NAME"
+    swap_to "$FALLBACK_NAME" || log "Both accounts unavailable"
+fi
+
+primary_fail_count=0
+MAX_FAILS=3
+LONG_RETRY=1800  # 30 min
 
 while true; do
     current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
-    now=$(date +%s)
-    
-    if [ "$current" = "indien" ]; then
-        # === ON INDIEN ===
-        # Check if rate limited
-        is_rate_limited
+
+    if [ "$current" = "$PRIMARY_NAME" ]; then
+        # ═══ ON PRIMARY — just monitor for 429 ═══
+        check_account "$PRIMARY_CREDS"
         rc=$?
-        if [ $rc -eq 0 ]; then
-            # Rate limited — record block start (now - 5h), swap to perso
-            reset_at=$((now + BLOCK_HOURS * 3600))
-            echo "$now" > "$BLOCK_START_FILE"
-            log "INDIEN rate limited! Reset at $(date -d @$reset_at '+%H:%M')"
-            if swap_to perso; then
-                log "On perso until $(date -d @$reset_at '+%H:%M')"
+        if [ $rc -eq 1 ]; then
+            # Rate limited!
+            date +%s > "$RATE_LIMITED_AT"
+            estimated_clear=$(date -d "+${WINDOW_HOURS} hours" '+%H:%M' 2>/dev/null || date -v+${WINDOW_HOURS}H '+%H:%M' 2>/dev/null || echo "~5h")
+            log "$PRIMARY_NAME rate limited! Estimated clear: $estimated_clear"
+
+            if swap_to "$FALLBACK_NAME"; then
+                log "Switched to $FALLBACK_NAME until ~$estimated_clear"
             else
-                log "Perso unhealthy too! Waiting on indien..."
+                log "$FALLBACK_NAME unavailable too — waiting on $PRIMARY_NAME"
             fi
         elif [ $rc -eq 2 ]; then
-            # Broken — try perso
-            indien_broken=true
-            log "INDIEN broken! Trying perso..."
-            swap_to perso || log "Both broken, waiting..."
+            # Broken
+            primary_fail_count=$((primary_fail_count + 1))
+            log "$PRIMARY_NAME broken (fail #$primary_fail_count)"
+            swap_to "$FALLBACK_NAME" || log "Both accounts down"
         fi
-        # Sleep longer when things are fine
         sleep "$CHECK_INTERVAL"
-        
-    else
-        # === ON PERSO ===
-        # Calculate when indien resets
-        reset_at=$(get_block_reset_time)
-        
-        if [ "$reset_at" -gt 0 ] && [ "$now" -ge "$reset_at" ] && [ "$indien_broken" = false ]; then
-            # Reset time reached — try indien
-            log "Indien reset time reached! Checking..."
-            if is_account_healthy "$INDIEN" && ! is_rate_limited "$INDIEN"; then
-                swap_to indien && log "Back on indien!" || true
-            else
-                # Still limited — extend by 30min
-                echo $((now + 1800)) > "$BLOCK_START_FILE"
-                log "Indien still limited, retry in 30min"
+
+    elif [ "$current" = "$FALLBACK_NAME" ]; then
+        # ═══ ON FALLBACK — wait for primary to clear ═══
+        now=$(date +%s)
+
+        # Calculate how long to wait
+        if [ -f "$RATE_LIMITED_AT" ]; then
+            limited_at=$(cat "$RATE_LIMITED_AT")
+            clear_at=$((limited_at + WINDOW_HOURS * 3600))
+            remaining=$((clear_at - now))
+
+            if [ $remaining -gt 0 ]; then
+                # Still in the window — sleep until clear time
+                log "Waiting ${remaining}s for $PRIMARY_NAME sliding window to clear ($(date -d @$clear_at '+%H:%M' 2>/dev/null || echo 'soon'))"
+                sleep $remaining
+                continue  # Go straight to the check below
             fi
-            sleep "$CHECK_INTERVAL"
-        elif [ "$indien_broken" = true ]; then
-            # Indien was broken — check every 30min
-            if [ $((now % 1800)) -lt "$CHECK_INTERVAL" ]; then
-                if is_account_healthy "$INDIEN"; then
-                    indien_broken=false
-                    log "Indien recovered!"
-                    if ! is_rate_limited "$INDIEN"; then
-                        swap_to indien || true
-                    fi
-                fi
+        fi
+
+        # Window should be clear — try primary
+        retry_interval=$CHECK_INTERVAL
+        [ $primary_fail_count -ge $MAX_FAILS ] && retry_interval=$LONG_RETRY
+
+        check_account "$PRIMARY_CREDS"
+        rc=$?
+        if [ $rc -eq 0 ]; then
+            # Primary is back!
+            if swap_to "$PRIMARY_NAME"; then
+                log "Back on $PRIMARY_NAME!"
+                primary_fail_count=0
+                rm -f "$RATE_LIMITED_AT"
             fi
-            sleep "$CHECK_INTERVAL"
+        elif [ $rc -eq 1 ]; then
+            # Still rate limited — the window hasn't fully cleared
+            # This means heavy usage, extend wait by 30 min
+            log "$PRIMARY_NAME still rate limited, extending wait 30min"
+            date +%s > "$RATE_LIMITED_AT"  # reset the timer
+            sleep 1800
+            continue
         else
-            # Waiting for reset — sleep until reset time (smart, no wasted cycles)
-            if [ "$reset_at" -gt 0 ]; then
-                wait_secs=$((reset_at - now))
-                if [ "$wait_secs" -gt 0 ] && [ "$wait_secs" -lt 18000 ]; then
-                    log "Sleeping ${wait_secs}s until indien resets at $(date -d @$reset_at '+%H:%M')"
-                    sleep "$wait_secs"
-                    continue  # Skip the default sleep, go straight to check
-                fi
-            fi
-            sleep "$CHECK_INTERVAL"
+            # Broken
+            primary_fail_count=$((primary_fail_count + 1))
+            log "$PRIMARY_NAME still broken (fail #$primary_fail_count), retry in ${retry_interval}s"
         fi
-    fi
-    
-    # Renew session if block is about to expire (proactive renewal)
-    block_reset=$(get_block_reset_time)
-    if [ "$block_reset" -gt 0 ]; then
-        time_left=$((block_reset - now))
-        if [ "$time_left" -le 300 ] && [ "$time_left" -ge 0 ]; then
-            renew_session "$current"
+
+        # Also check if fallback is still OK
+        check_account "$FALLBACK_CREDS"
+        frc=$?
+        if [ $frc -eq 1 ]; then
+            log "$FALLBACK_NAME also rate limited now!"
+            # Both limited — check if primary cleared
+            check_account "$PRIMARY_CREDS"
+            [ $? -eq 0 ] && swap_to "$PRIMARY_NAME" && log "Emergency swap back to $PRIMARY_NAME"
         fi
+
+        sleep "$retry_interval"
+    else
+        # Unknown state — try to recover
+        log "Unknown state '$current', attempting recovery..."
+        swap_to "$PRIMARY_NAME" || swap_to "$FALLBACK_NAME" || true
+        sleep "$CHECK_INTERVAL"
     fi
 done

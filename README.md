@@ -4,35 +4,31 @@ Lightweight daemon that keeps your Claude Code sessions alive and automatically 
 
 ## The Problem
 
-Claude Code has two usage limits:
-- **5-hour rolling window**: starts when you send your first message, resets 5h later
-- **Weekly cap**: hard limit per billing week
+Claude Code uses a **sliding window**: your usage over the trailing 5 hours is tracked. When it exceeds the threshold, you get 429 rate limited. Old usage naturally falls off after 5h. There's nothing to "renew" or "ping" — you just have to wait.
 
-If you don't send a message when your 5h window resets, you lose time. If you hit the limit on one account, you're stuck waiting.
+If you have two accounts, you can swap to the other one while waiting. That's what this tool does.
 
 ## What This Does
 
-### Single Account (default, zero config)
-If you only have one Claude account, the daemon:
-- Tracks when your 5h block started
-- Automatically pings Claude 5 minutes before the block expires to start a new one
-- Keeps your sessions rolling 24/7 with zero gaps
-- That's it. No swap, no complexity.
+### Single Account (default)
+Monitors your account. Logs when you get rate limited and estimates when it clears. That's it — there's nothing to "renew" with a sliding window.
 
-### Dual Account (optional)
+### Dual Account (the real value)
 If you configure two accounts (e.g. work + personal):
 - Uses your **primary account** by default
-- If primary hits rate limit (429) → checks fallback is healthy → swaps
-- **Calculates the exact reset time** (block start + 5h) and sleeps until then (no polling)
-- At reset time → checks primary → swaps back
+- When primary gets 429 → checks fallback is healthy → **swaps immediately**
+- Records when the 429 happened → calculates when the sliding window clears (now + 5h)
+- **Sleeps until clear time** (no polling waste)
+- At clear time → checks primary → swaps back
+- If primary is still limited (heavy usage) → extends wait 30min
 - Never swaps to a broken account (expired token, 401, network error)
-- If both accounts are exhausted → stays on whichever was last working, waits for reset
+- If both accounts 429 → stays put, waits for whichever clears first
 
-### Safety Guarantees
-- **Never swaps blindly**: always checks target account health before swapping
-- **Never loops on broken accounts**: after 3 failures, backs off to 30min retry
-- **Survives reboots**: systemd service with auto-restart
-- **Zero resource usage**: no polling loop, no npm packages, no API scraping. Just `sleep` + one `curl` check when needed (~10ms)
+### Safety
+- **Checks before every swap**: target must be healthy (200) before copying credentials
+- **Backoff on broken accounts**: 3 failures → 30min retry interval
+- **Survives reboots**: systemd service, auto-restart on crash
+- **Minimal resource usage**: sleeps most of the time. One `curl` check (~10ms) only when needed
 
 ## Quick Start
 
@@ -189,13 +185,13 @@ The daemon copies between these files to swap accounts. No tokens are stored in 
 ## FAQ
 
 **Q: I only have one account. Does this do anything?**
-Yes. It auto-renews your 5h session block so you never lose time between blocks.
+Not much. It monitors and logs when you get rate limited. The real value is dual-account swap.
 
 **Q: What if both accounts are dead?**
 The daemon waits. It calculates when the primary resets and sleeps until then. No wasted CPU.
 
 **Q: Does this consume Claude usage?**
-The renewal ping sends one minimal message every 5 hours. Health checks use `curl` against the auth endpoint (zero token usage).
+No. Health checks use `curl` against the auth endpoint — zero token consumption. No pings, no messages sent.
 
 **Q: What if a token expires?**
 The daemon detects 401/403, marks the account as broken, and stays on the working account. Run `claude login` + `/account save <name>` to refresh.

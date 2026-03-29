@@ -1,100 +1,73 @@
 # Claude Session Manager
 
-Daemon that keeps your Claude Code sessions alive and swaps between accounts automatically.
+Daemon that auto-renews Claude Code sessions and swaps between accounts when rate limited.
 
 Survives reboots, crashes, logout. Zero manual intervention.
 
-## What It Does
+## 3 Independent Modules
 
-### 3 independent functions:
-
-**1. RENEW (always active, even 1 account)**
-- Every 5h: pings Claude to keep the sliding window active
-- 24/7, even at night
-- In dual mode: renews the fallback (perso) account specifically, so it's always ready
-- In single mode: renews your only account
-- Cost: 1 token per ping
-
-**2. SWAP indien→perso (dual mode only)**
-- Monitors indien usage by reading local session files (zero API cost)
-- At 95% usage → auto-swap to perso
-- Also supports manual swap via `touch /tmp/claude-request-swap`
-
-**3. SWAP perso→indien (dual mode only)**
-- Indien is ALWAYS priority (free enterprise account)
-- When indien hits limit, records the time
-- Calculates when window clears (limit_time + 5h)
-- Sleeps until then, checks indien, swaps back immediately
-- If still limited → extends wait 30min, retries
-
-## Algo
+### Module 1 — RENEW INDIEN (background process)
 
 ```
-                 ┌─────────────────────────┐
-                 │        START             │
-                 │  systemd / boot / crash  │
-                 └────────────┬────────────┘
-                              │
-                 ┌────────────▼────────────┐
-                 │  2 credential files?     │
-                 │  indien.json + perso.json│
-                 └─────┬──────────┬────────┘
-                       │YES       │NO
-                       ▼          ▼
-              DUAL MODE      SINGLE MODE
-              (swap+renew)   (renew only)
-                       │          │
-                       ▼          │
-              ┌────────────┐      │
-              │ Test indien │      │
-              └──┬───┬───┬─┘      │
-                 │   │   │        │
-               OK  429  err       │
-                 │   │   │        │
-                 ▼   ▼   ▼        │
-              indien perso perso   │
-                 │   │   │        │
-          ┌──────▼───▼───▼────────▼─┐
-          │                         │
-          │      MAIN LOOP          │
-          │      every 5 min        │
-          │                         │
-          ├─────────────────────────┤
-          │                         │
-          │  1. RENEW (always)      │
-          │     every 5h:           │
-          │     dual → ping perso   │
-          │     single → ping self  │
-          │                         │
-          ├─────────────────────────┤
-          │                         │
-          │  2. SWAP (dual only)    │
-          │                         │
-          │  ON INDIEN:             │
-          │    read local files     │
-          │    (zero cost)          │
-          │    if usage >= 95%      │
-          │    → swap to perso      │
-          │    record limit time    │
-          │                         │
-          │  ON PERSO:              │
-          │    sleep until           │
-          │    limit_time + 5h      │
-          │    test indien (1 tok)  │
-          │    if OK → swap back    │
-          │    if 429 → wait +30min │
-          │    if err → wait +1h    │
-          │                         │
-          └─────────────────────────┘
+Read /tmp/claude-quota-cache-indien.json → reset: 15:00
+Sleep until 15:02
+Ping indien (1 token)
+Success → loop, wait for next reset from cache
+Failure → retry every 2 min until OK
 ```
+
+### Module 2 — RENEW PERSO (background process)
+
+```
+Read /tmp/claude-quota-cache-perso.json → reset: 13:00
+Sleep until 13:02
+Ping perso (1 token)
+Success → loop, wait for next reset from cache
+Failure → retry every 2 min until OK
+```
+
+Both renew modules run 24/7, independently, even at night. They read the **real reset time** from quota cache files (updated by Claude Code statusline every 60s). No guessing.
+
+### Module 3 — SWAP (foreground process, only if 2 accounts)
+
+```
+Every 5 min: read quota cache of active account → usage %
+
+ON INDIEN (gratuit, preferred):
+  usage < 95% → do nothing
+  usage >= 95% → swap to perso
+
+ON PERSO (payant, fallback):
+  Read indien cache → reset time
+  Sleep until reset + 2 min
+  Test indien via CLI (1 token)
+  OK → swap back to indien
+  Still limited → retry in 5 min
+  Broken → retry in 5 min (max 3 fails, then 1h)
+```
+
+Indien is **always priority**. As soon as it's available, swap back.
+
+## How Reset Times Are Known
+
+Claude Code's statusline writes quota info to `/tmp/claude-quota-cache-{account}.json` every 60 seconds:
+
+```json
+{"util": 0.53, "reset": 1774789200}
+```
+
+- `util`: usage as fraction (0.53 = 53%)
+- `reset`: unix timestamp of next reset
+
+The daemon reads these files. No API calls needed for monitoring.
 
 ## Setup Modes
 
-| Config | What happens |
-|--------|-------------|
-| **No creds saved** | Daemon sleeps. Nothing happens. |
-| **1 account** | RENEW only. Pings every 5h to keep window active. |
-| **2 accounts** | RENEW perso 24/7 + SWAP at 95% + auto swap back to indien. |
+| Config | What runs |
+|--------|-----------|
+| **No creds saved** | Nothing. Daemon sleeps. |
+| **1 account** | RENEW only for that account. |
+| **2 accounts** | RENEW both + SWAP at 95%. |
 
 ## Install
 
@@ -105,21 +78,13 @@ chmod +x install.sh
 ./install.sh
 ```
 
-Installs:
-- systemd user service (auto-start at boot, auto-restart on crash, survives logout)
-- `/account` + `/swap` slash commands in Claude Code
-
 ### Save credentials
 
 ```bash
-# On the indien account:
-claude login
-# Then in Claude Code:
+# Login to indien, then in Claude Code:
 /account save indien
 
-# On the perso account:
-claude login
-# Then in Claude Code:
+# Login to perso, then in Claude Code:
 /account save perso
 ```
 
@@ -127,20 +92,19 @@ claude login
 
 | Event | Behavior |
 |-------|----------|
-| **Reboot** | Auto-starts (systemd enabled + linger) |
-| **Crash** | Auto-restarts in 30s (Restart=always) |
-| **Logout** | Keeps running (linger=yes) |
-| **Network down** | Retries, doesn't crash |
-| **Both accounts dead** | Stays on last working, retries every 30min |
+| Reboot | Auto-starts (systemd enabled + linger) |
+| Crash | Restarts in 30s (Restart=always) |
+| Logout | Keeps running (linger=yes) |
+| Network down | Retries, doesn't crash |
 
 ## Cost
 
 | Action | Tokens | When |
 |--------|:------:|------|
-| Read local session files | **0** | Every 5 min (usage monitoring) |
-| Renew ping | **~1** | Every 5h (keep window active) |
-| Health check indien | **~1** | Only when testing swap back |
-| Sleep | **0** | Most of the time |
+| Read quota cache | **0** | Every 5 min |
+| Renew ping | **~1** | At each reset time (~every 5h per account) |
+| Test indien (swap back) | **~1** | After indien reset, once |
+| Total per day | **~10** | Negligible |
 
 ## Configuration
 
@@ -155,12 +119,13 @@ claude login
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `CHECK_INTERVAL` | 300 (5min) | Main loop frequency |
-| `SWAP_THRESHOLD` | 95 | Auto-swap at this % |
-| `RENEW_INTERVAL` | 18000 (5h) | Renew ping frequency |
-| `RECOVERY_INTERVAL` | 1800 (30min) | Retry indien when limited |
-| `LONG_RETRY` | 3600 (1h) | Retry indien when broken |
+| `CHECK_INTERVAL` | 300 (5min) | Main loop + retry frequency |
+| `SWAP_THRESHOLD` | 95 | Swap at this usage % |
+| `RENEW_MARGIN` | 120 (2min) | Wait after reset before pinging |
+| `RENEW_RETRY` | 120 (2min) | Retry interval if renew fails |
+| `RECOVERY_INTERVAL` | 300 (5min) | Recheck indien when on perso |
 | `MAX_FAILS` | 3 | Failures before long retry |
+| `LONG_RETRY` | 3600 (1h) | Retry after repeated failures |
 
 ## Commands
 
@@ -170,28 +135,45 @@ systemctl --user status claude-manager
 systemctl --user restart claude-manager
 systemctl --user stop claude-manager
 tail -f ~/.claude-manager.log
-cat /tmp/claude-account-state
 
 # In Claude Code
-/account              # status
+/account              # show status + usage + next reset
 /account swap          # manual swap
-/account save indien   # save current creds
+/account save indien   # save credentials
 
 # Force swap from terminal
 touch /tmp/claude-request-swap
+
+# Check next renew/reset times
+python3 -c "
+import json, datetime
+for name in ['indien', 'perso']:
+    d = json.load(open(f'/tmp/claude-quota-cache-{name}.json'))
+    print(f'{name}: {d[\"util\"]*100:.0f}% usage, reset {datetime.datetime.fromtimestamp(d[\"reset\"]).strftime(\"%H:%M\")}')
+"
 ```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `claude-manager.sh` | Main daemon |
-| `check-usage.py` | Reads local JSONL, returns usage % |
+| `claude-manager.sh` | Main daemon (3 modules) |
+| `check-usage.py` | Fallback: scan JSONL if no cache |
 | `claude-manager.service` | systemd unit |
 | `account.md` | `/account` slash command |
 | `swap.md` | `/swap` slash command |
 | `install.sh` | Install |
 | `uninstall.sh` | Uninstall |
+
+## Cache Files
+
+| File | Updated by | Content |
+|------|-----------|---------|
+| `/tmp/claude-quota-cache-indien.json` | statusline (60s) | `{util, reset}` |
+| `/tmp/claude-quota-cache-perso.json` | statusline (60s) | `{util, reset}` |
+| `/tmp/claude-last-renew-indien` | daemon | epoch of last renew |
+| `/tmp/claude-last-renew-perso` | daemon | epoch of last renew |
+| `/tmp/claude-account-state` | daemon | active account name |
 
 ## License
 

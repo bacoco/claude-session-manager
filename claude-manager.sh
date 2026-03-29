@@ -136,12 +136,13 @@ do_renew() {
     cp "$backup" "$CREDS_FILE" 2>/dev/null
     rm -f "$backup"
 
-    date +%s > "$LAST_RENEW_FILE"
-
     if [ $rc -eq 0 ]; then
-        log "RENEW $target_name: OK"
+        date +%s > "$LAST_RENEW_FILE"
+        next=$(date -d "+${WINDOW_HOURS} hours +2 minutes" '+%H:%M' 2>/dev/null || echo "~5h")
+        log "RENEW $target_name: OK — next at $next"
     else
-        log "RENEW $target_name: failed"
+        # Don't update LAST_RENEW_FILE — will retry in 2 min
+        log "RENEW $target_name: FAILED — retry in 2 min"
     fi
 }
 
@@ -190,14 +191,13 @@ while true; do
     now=$(date +%s)
 
     # ─────────────────────────────────────────────────────
-    # 1. RENEW — smart timing: 5h01 after last activity
-    #    on the target account, so the window is clean
+    # 1. RENEW PERSO — simple: last_renew + 5h02 = next renew
+    #    If renew fails (429) → retry every 2 min until it works
     # ─────────────────────────────────────────────────────
     last_renew=$(cat "$LAST_RENEW_FILE" 2>/dev/null || echo 0)
-    since_renew=$((now - last_renew))
+    next_renew=$((last_renew + RENEW_INTERVAL + 120))  # +2 min margin after window clears
 
-    if [ $since_renew -ge $RENEW_INTERVAL ]; then
-        # Find when the target account was last used (from local session files)
+    if [ $now -ge $next_renew ]; then
         if [ "$SWAP_ENABLED" = true ]; then
             target_creds="$FALLBACK_CREDS"
             target_name="perso"
@@ -206,43 +206,9 @@ while true; do
             target_name="current"
         fi
 
-        # Get last activity timestamp from session files
-        last_activity=$(python3 -c "
-import glob, os, json, time
-from datetime import datetime, timezone, timedelta
-now = datetime.now(timezone.utc)
-latest = 0
-for proj in glob.glob(os.path.expanduser('~/.claude/projects/*/')):
-    for f in glob.glob(f'{proj}/*.jsonl'):
-        try:
-            if time.time() - os.path.getmtime(f) > 7*3600: continue
-            for line in open(f):
-                try:
-                    d = json.loads(line)
-                    ts = d.get('timestamp','')
-                    if not isinstance(ts, str) or not ts: continue
-                    t = datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp()
-                    if t > latest: latest = t
-                except: pass
-        except: pass
-print(int(latest))
-" 2>/dev/null || echo 0)
-
-        # Renew 5h01 after last activity (window fully cleared + 1 min margin)
-        optimal_renew_at=$((last_activity + RENEW_INTERVAL + 60))
-
-        if [ $now -ge $optimal_renew_at ]; then
-            optimal_time=$(date -d @$optimal_renew_at '+%H:%M' 2>/dev/null || echo "now")
-            log "RENEW $target_name: optimal time reached ($optimal_time), window clear"
-            do_renew "$target_creds" "$target_name"
-        else
-            wait_secs=$((optimal_renew_at - now))
-            if [ $wait_secs -lt 600 ]; then
-                # Less than 10 min — just wait
-                log "RENEW $target_name: waiting ${wait_secs}s for optimal time ($(date -d @$optimal_renew_at '+%H:%M' 2>/dev/null))"
-            fi
-            # Otherwise stay quiet, check next loop iteration
-        fi
+        do_renew "$target_creds" "$target_name"
+        # Check if it worked — if not, retry in 2 min (don't update LAST_RENEW_FILE)
+        # do_renew already writes LAST_RENEW_FILE on success
     fi
 
     # ─────────────────────────────────────────────────────

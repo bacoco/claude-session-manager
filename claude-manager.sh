@@ -29,9 +29,13 @@ WINDOW_HOURS=5
 CHECK_INTERVAL=300       # 5 min — read local files (zero cost)
 SWAP_THRESHOLD=95        # Swap indien→perso at this %
 RECOVERY_INTERVAL=1800   # 30 min — check indien via CLI when on perso (costs 1 token)
+RENEW_INTERVAL=18000     # 5h — ping after this much inactivity to start new window
+RENEW_START_HOUR=8       # Don't renew before this hour (avoid wasting window while sleeping)
+RENEW_STOP_HOUR=23       # Don't renew after this hour
 MAX_FAILS=3
 LONG_RETRY=3600          # 1h after repeated failures
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LAST_ACTIVITY_FILE="/tmp/claude-last-activity"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
@@ -87,6 +91,37 @@ check_account_via_cli() {
     fi
 }
 
+get_last_activity() {
+    # Get timestamp of last Claude Code activity from local session files
+    python3 -c "
+import glob, os, json
+now = __import__('time').time()
+latest = 0
+for f in glob.glob(os.path.expanduser('~/.claude/projects/*/*.jsonl')):
+    try:
+        mtime = os.path.getmtime(f)
+        if mtime > latest: latest = mtime
+    except: pass
+# Also check history.jsonl
+try:
+    h = os.path.getmtime(os.path.expanduser('~/.claude/history.jsonl'))
+    if h > latest: latest = h
+except: pass
+print(int(latest))
+" 2>/dev/null
+}
+
+do_renew() {
+    # Send minimal ping to start a new sliding window
+    log "RENEW: Sending ping to keep session alive..."
+    echo "ok" | timeout 30 claude -p "reply OK" --max-turns 1 >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log "RENEW: OK — new window started"
+    else
+        log "RENEW: failed (rate limited or broken)"
+    fi
+}
+
 do_swap() {
     # Swap to target. Checks health first.
     local target_name=$1
@@ -115,28 +150,31 @@ do_swap() {
 
 log "=== Claude Session Manager started ==="
 
-# Check mode
-if [ ! -f "$PRIMARY_CREDS" ] || [ ! -f "$FALLBACK_CREDS" ]; then
-    log "SINGLE MODE — need 2 credential files for auto-swap"
-    log "  Save creds: /account save indien  +  /account save perso"
-    while true; do sleep 3600; done
-fi
-
-log "DUAL MODE: primary=$PRIMARY_NAME (preferred), fallback=$FALLBACK_NAME (safety net)"
-
-# Start: try indien first
-check_account_via_cli "$PRIMARY_CREDS"
-rc=$?
-if [ $rc -eq 0 ]; then
-    do_swap "$PRIMARY_NAME"
-    log "Started on $PRIMARY_NAME"
-elif [ $rc -eq 1 ]; then
-    log "$PRIMARY_NAME rate limited at startup, using $FALLBACK_NAME"
-    date +%s > "$RATE_LIMITED_AT"
-    do_swap "$FALLBACK_NAME"
+# Detect mode
+SWAP_ENABLED=false
+if [ -f "$PRIMARY_CREDS" ] && [ -f "$FALLBACK_CREDS" ]; then
+    SWAP_ENABLED=true
+    log "SWAP enabled: primary=$PRIMARY_NAME, fallback=$FALLBACK_NAME"
 else
-    log "$PRIMARY_NAME broken, using $FALLBACK_NAME"
-    do_swap "$FALLBACK_NAME"
+    log "SWAP disabled (need 2 credential files)"
+fi
+log "RENEW enabled: ping every ${RENEW_INTERVAL}s of inactivity"
+
+# Start: try indien first (only if swap enabled)
+if [ "$SWAP_ENABLED" = true ]; then
+    check_account_via_cli "$PRIMARY_CREDS"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        do_swap "$PRIMARY_NAME"
+        log "Started on $PRIMARY_NAME"
+    elif [ $rc -eq 1 ]; then
+        log "$PRIMARY_NAME rate limited at startup, using $FALLBACK_NAME"
+        date +%s > "$RATE_LIMITED_AT"
+        do_swap "$FALLBACK_NAME"
+    else
+        log "$PRIMARY_NAME broken, using $FALLBACK_NAME"
+        do_swap "$FALLBACK_NAME"
+    fi
 fi
 
 fail_count=0
@@ -146,92 +184,92 @@ fail_count=0
 # ═══════════════════════════════════════════════════════════
 
 while true; do
-    current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
-    if [ "$current" = "$PRIMARY_NAME" ]; then
-        # ─── ON INDIEN ───────────────────────────────────
-        # Monitor usage by reading local files (FREE)
-        # If usage >= 95% → swap to perso
-        # If manual swap requested → swap to perso
+    # ═══════════════════════════════════════════════════════
+    # RENEW — always active, even with 1 account
+    # Ping after RENEW_INTERVAL of inactivity to start new window
+    # ═══════════════════════════════════════════════════════
+    last_activity=$(get_last_activity)
+    now=$(date +%s)
+    current_hour=$(date +%H)
+    idle_secs=$((now - last_activity))
 
-        usage=$(get_usage_pct)
+    if [ $idle_secs -ge $RENEW_INTERVAL ] && \
+       [ "$current_hour" -ge "$RENEW_START_HOUR" ] && \
+       [ "$current_hour" -lt "$RENEW_STOP_HOUR" ]; then
+        log "IDLE ${idle_secs}s (>= ${RENEW_INTERVAL}s), hour=$current_hour — sending renew ping"
+        do_renew
+    fi
 
-        # Manual swap request
-        if [ -f "/tmp/claude-request-swap" ]; then
-            rm -f "/tmp/claude-request-swap"
-            log "Manual swap requested (usage: ${usage}%)"
-            date +%s > "$RATE_LIMITED_AT"
-            do_swap "$FALLBACK_NAME"
-        # Usage threshold
-        elif [ "$(echo "$usage >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-            log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — swapping to $FALLBACK_NAME"
-            date +%s > "$RATE_LIMITED_AT"
-            do_swap "$FALLBACK_NAME"
-        fi
+    # ═══════════════════════════════════════════════════════
+    # SWAP — only if 2 accounts configured
+    # ═══════════════════════════════════════════════════════
+    if [ "$SWAP_ENABLED" = true ]; then
+        current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
-        sleep "$CHECK_INTERVAL"
+        if [ "$current" = "$PRIMARY_NAME" ]; then
+            # ─── ON INDIEN: monitor usage (FREE), swap at threshold ───
+            usage=$(get_usage_pct)
 
-    elif [ "$current" = "$FALLBACK_NAME" ]; then
-        # ─── ON PERSO ────────────────────────────────────
-        # Wait for indien to become available again
-        # Strategy:
-        #   1. If we know when indien was limited → sleep until clear time
-        #   2. Then check indien via CLI (costs 1 token)
-        #   3. If OK → swap back to indien
-        #   4. If still limited → wait 30 more minutes
-        #   5. If broken → wait longer (1h)
+            if [ -f "/tmp/claude-request-swap" ]; then
+                rm -f "/tmp/claude-request-swap"
+                log "Manual swap requested (usage: ${usage}%)"
+                date +%s > "$RATE_LIMITED_AT"
+                do_swap "$FALLBACK_NAME"
+            elif [ "$(echo "$usage >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+                log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — swapping to $FALLBACK_NAME"
+                date +%s > "$RATE_LIMITED_AT"
+                do_swap "$FALLBACK_NAME"
+            fi
 
-        now=$(date +%s)
+        elif [ "$current" = "$FALLBACK_NAME" ]; then
+            # ─── ON PERSO: wait for indien, swap back when clear ───
+            now=$(date +%s)
 
-        # Calculate when indien should be clear
-        if [ -f "$RATE_LIMITED_AT" ]; then
-            limited_at=$(cat "$RATE_LIMITED_AT")
-            clear_at=$((limited_at + WINDOW_HOURS * 3600))
-            remaining=$((clear_at - now))
+            if [ -f "$RATE_LIMITED_AT" ]; then
+                limited_at=$(cat "$RATE_LIMITED_AT")
+                clear_at=$((limited_at + WINDOW_HOURS * 3600))
+                remaining=$((clear_at - now))
 
-            if [ $remaining -gt 0 ]; then
-                log "Sleeping ${remaining}s until $PRIMARY_NAME window clears (~$(date -d @$clear_at '+%H:%M' 2>/dev/null || echo "${remaining}s"))"
-                sleep $remaining
+                if [ $remaining -gt 0 ]; then
+                    log "Sleeping ${remaining}s until $PRIMARY_NAME clears (~$(date -d @$clear_at '+%H:%M' 2>/dev/null || echo "${remaining}s"))"
+                    sleep $remaining
+                    continue
+                fi
+            fi
+
+            log "Testing $PRIMARY_NAME..."
+            check_account_via_cli "$PRIMARY_CREDS"
+            rc=$?
+
+            if [ $rc -eq 0 ]; then
+                do_swap "$PRIMARY_NAME"
+                log "Back on $PRIMARY_NAME!"
+                fail_count=0
+                rm -f "$RATE_LIMITED_AT"
+            elif [ $rc -eq 1 ]; then
+                log "$PRIMARY_NAME still limited, +30min"
+                date +%s > "$RATE_LIMITED_AT"
+                sleep "$RECOVERY_INTERVAL"
+                continue
+            else
+                fail_count=$((fail_count + 1))
+                retry=$RECOVERY_INTERVAL
+                [ $fail_count -ge $MAX_FAILS ] && retry=$LONG_RETRY
+                log "$PRIMARY_NAME broken (#$fail_count), retry ${retry}s"
+                sleep "$retry"
                 continue
             fi
-        fi
-
-        # Window should be clear — test indien (costs 1 token)
-        log "Testing $PRIMARY_NAME..."
-        check_account_via_cli "$PRIMARY_CREDS"
-        rc=$?
-
-        if [ $rc -eq 0 ]; then
-            do_swap "$PRIMARY_NAME"
-            log "Back on $PRIMARY_NAME!"
-            fail_count=0
-            rm -f "$RATE_LIMITED_AT"
-        elif [ $rc -eq 1 ]; then
-            log "$PRIMARY_NAME still limited, waiting ${RECOVERY_INTERVAL}s"
-            # Reset timer — still in the window
-            date +%s > "$RATE_LIMITED_AT"
-            sleep "$RECOVERY_INTERVAL"
-            continue
         else
-            fail_count=$((fail_count + 1))
-            retry=$RECOVERY_INTERVAL
-            [ $fail_count -ge $MAX_FAILS ] && retry=$LONG_RETRY
-            log "$PRIMARY_NAME broken (fail #$fail_count), retry in ${retry}s"
-            sleep "$retry"
-            continue
+            # Unknown → recover
+            check_account_via_cli "$PRIMARY_CREDS"
+            if [ $? -eq 0 ]; then
+                do_swap "$PRIMARY_NAME"
+            else
+                do_swap "$FALLBACK_NAME" 2>/dev/null
+            fi
         fi
-
-        sleep "$RECOVERY_INTERVAL"
-
-    else
-        # Unknown state — recover
-        log "Unknown state, trying $PRIMARY_NAME..."
-        check_account_via_cli "$PRIMARY_CREDS"
-        if [ $? -eq 0 ]; then
-            do_swap "$PRIMARY_NAME"
-        else
-            do_swap "$FALLBACK_NAME" 2>/dev/null
-        fi
-        sleep "$CHECK_INTERVAL"
     fi
+
+    sleep "$CHECK_INTERVAL"
 done

@@ -107,31 +107,41 @@ do_swap() {
     return 0
 }
 
-do_renew_perso() {
-    # Ping perso to keep its window active — runs 24/7
-    # Temporarily swaps to perso, pings, swaps back
-    log "RENEW PERSO: pinging..."
+do_renew() {
+    # Renew a specific account by pinging it
+    # In dual mode: always renew perso (fallback) to keep it fresh
+    # In single mode: renew the current/only account
+    local target_creds="${1:-$CREDS_FILE}"
+    local target_name="${2:-current}"
+
+    log "RENEW $target_name: pinging..."
 
     local backup=$(mktemp)
     cp "$CREDS_FILE" "$backup" 2>/dev/null
-    cp "$FALLBACK_CREDS" "$CREDS_FILE" 2>/dev/null
+
+    # Switch to target if different from active
+    if [ "$target_creds" != "$CREDS_FILE" ] && [ -f "$target_creds" ]; then
+        cp "$target_creds" "$CREDS_FILE" 2>/dev/null
+    fi
 
     echo "ok" | timeout 30 claude -p "reply OK" --max-turns 1 >/dev/null 2>&1
     local rc=$?
 
-    # Save refreshed perso creds
-    cp "$CREDS_FILE" "$FALLBACK_CREDS" 2>/dev/null
+    # Save refreshed creds back
+    if [ "$target_creds" != "$CREDS_FILE" ] && [ -f "$target_creds" ]; then
+        cp "$CREDS_FILE" "$target_creds" 2>/dev/null
+    fi
 
-    # Restore whatever account was active
+    # Restore active account
     cp "$backup" "$CREDS_FILE" 2>/dev/null
     rm -f "$backup"
 
     date +%s > "$LAST_RENEW_FILE"
 
     if [ $rc -eq 0 ]; then
-        log "RENEW PERSO: OK"
+        log "RENEW $target_name: OK"
     else
-        log "RENEW PERSO: failed"
+        log "RENEW $target_name: failed"
     fi
 }
 
@@ -146,7 +156,11 @@ if [ -f "$PRIMARY_CREDS" ] && [ -f "$FALLBACK_CREDS" ]; then
     SWAP_ENABLED=true
     log "SWAP: indien (gratuit) = primary, perso (payant) = fallback"
 fi
-log "RENEW PERSO: every 5h, 24/7"
+if [ "$SWAP_ENABLED" = true ]; then
+    log "RENEW: perso every 5h, 24/7"
+else
+    log "RENEW: current account every 5h, 24/7"
+fi
 
 # Startup: indien first
 if [ "$SWAP_ENABLED" = true ]; then
@@ -182,7 +196,13 @@ while true; do
     since_renew=$((now - last_renew))
 
     if [ $since_renew -ge $RENEW_INTERVAL ]; then
-        do_renew_perso
+        if [ "$SWAP_ENABLED" = true ]; then
+            # Dual mode: renew perso (fallback) to keep it always fresh
+            do_renew "$FALLBACK_CREDS" "perso"
+        else
+            # Single mode: renew the only account we have
+            do_renew "$CREDS_FILE" "current"
+        fi
     fi
 
     # ─────────────────────────────────────────────────────

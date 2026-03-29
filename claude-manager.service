@@ -1,12 +1,13 @@
 [Unit]
-Description=Claude Account Manager — unified session renewal + smart swap
-After=network.target
+Description=Claude Session Manager — renew + swap
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/baconnier/dev/CCAutoRenew/claude-manager.sh
-Restart=on-failure
-RestartSec=120
+ExecStart=/home/baconnier/dev/claude-session-manager/claude-manager.sh
+Restart=always
+RestartSec=30
 Environment=PATH=/home/baconnier/.local/bin:/home/baconnier/.nvm/versions/node/v20.20.0/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]

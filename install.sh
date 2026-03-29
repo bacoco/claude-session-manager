@@ -47,3 +47,7 @@ echo "Prerequisites:"
 echo "  ~/.claude/.credentials-indien.json   # indien account creds"
 echo "  ~/.claude/.credentials-perso.json    # perso account creds"
 echo "  Run 'claude login' on each account, then '/swap save indien' or '/swap save perso'"
+
+# 6. Install /account command for Claude Code
+cp "$SCRIPT_DIR/account.md" ~/.claude/commands/account.md
+echo "  /account command installed"

@@ -29,7 +29,7 @@ LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
 RATE_LIMITED_AT="/tmp/claude-rate-limited-at"  # epoch when primary got 429
 WINDOW_HOURS=5
-CHECK_INTERVAL=300  # 5 min between checks when on fallback
+CHECK_INTERVAL=1800  # 30 min between checks (each check costs ~1 token via CLI)
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
@@ -54,27 +54,32 @@ except: print('error')
 
 check_account() {
     # Returns: 0=OK, 1=rate_limited, 2=broken/expired, 3=no_creds
+    # Uses claude CLI directly — it knows how to connect
     local creds_file=$1
     [ ! -f "$creds_file" ] && return 3
 
-    local token=$(python3 -c "
-import json
-try: print(json.load(open('$creds_file')).get('claudeAiOauth',{}).get('accessToken',''))
-except: print('')
-" 2>/dev/null)
+    # Temporarily swap creds to test this account
+    local backup=$(mktemp)
+    cp "$CREDS_FILE" "$backup" 2>/dev/null
+    cp "$creds_file" "$CREDS_FILE"
 
-    [ -z "$token" ] && return 2
+    # Minimal CLI call — costs ~1 token but 100% reliable
+    # Only called when deciding to swap, not in a tight loop
+    local output
+    output=$(echo "ok" | timeout 30 claude -p "reply with just OK" --max-turns 1 2>&1)
+    local rc=$?
 
-    local status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-        -H "Authorization: Bearer $token" \
-        "https://api.claude.ai/api/auth/session" 2>/dev/null)
+    # Restore original creds
+    cp "$backup" "$CREDS_FILE" 2>/dev/null
+    rm -f "$backup"
 
-    case "$status" in
-        200) return 0 ;;
-        429) return 1 ;;
-        401|403) return 2 ;;
-        *) return 2 ;;  # network error or unknown
-    esac
+    if [ $rc -eq 0 ]; then
+        return 0  # Account works
+    elif echo "$output" | grep -qi "rate.limit\|usage.limit\|429\|exceeded"; then
+        return 1  # Rate limited
+    else
+        return 2  # Broken/expired/other error
+    fi
 }
 
 swap_to() {
@@ -151,25 +156,16 @@ while true; do
     current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
     if [ "$current" = "$PRIMARY_NAME" ]; then
-        # ═══ ON PRIMARY — just monitor for 429 ═══
-        check_account "$PRIMARY_CREDS"
-        rc=$?
-        if [ $rc -eq 1 ]; then
-            # Rate limited!
+        # ═══ ON PRIMARY — do nothing, user is working ═══
+        # The daemon doesn't need to monitor primary actively.
+        # If user gets 429, they use /account swap or the daemon
+        # can be notified via a signal/file.
+        # Just sleep and check occasionally if a swap was requested.
+        if [ -f "/tmp/claude-request-swap" ]; then
+            rm -f "/tmp/claude-request-swap"
+            log "Swap requested! Checking $FALLBACK_NAME..."
             date +%s > "$RATE_LIMITED_AT"
-            estimated_clear=$(date -d "+${WINDOW_HOURS} hours" '+%H:%M' 2>/dev/null || date -v+${WINDOW_HOURS}H '+%H:%M' 2>/dev/null || echo "~5h")
-            log "$PRIMARY_NAME rate limited! Estimated clear: $estimated_clear"
-
-            if swap_to "$FALLBACK_NAME"; then
-                log "Switched to $FALLBACK_NAME until ~$estimated_clear"
-            else
-                log "$FALLBACK_NAME unavailable too — waiting on $PRIMARY_NAME"
-            fi
-        elif [ $rc -eq 2 ]; then
-            # Broken
-            primary_fail_count=$((primary_fail_count + 1))
-            log "$PRIMARY_NAME broken (fail #$primary_fail_count)"
-            swap_to "$FALLBACK_NAME" || log "Both accounts down"
+            swap_to "$FALLBACK_NAME" && log "Swapped to $FALLBACK_NAME" || log "$FALLBACK_NAME unavailable"
         fi
         sleep "$CHECK_INTERVAL"
 

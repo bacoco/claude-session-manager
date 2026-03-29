@@ -62,7 +62,26 @@ except: print('error')
 }
 
 get_usage_pct() {
-    python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0"
+    # Read from real quota cache (updated by statusline every 60s)
+    local current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+    local cache="/tmp/claude-quota-cache-${current}.json"
+    if [ -f "$cache" ]; then
+        python3 -c "import json; print(json.load(open('$cache')).get('util', 0) * 100)" 2>/dev/null || echo "0"
+    else
+        # Fallback to session file scanning
+        python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0"
+    fi
+}
+
+get_reset_time() {
+    # Get real reset timestamp from cache
+    local account=$1
+    local cache="/tmp/claude-quota-cache-${account}.json"
+    if [ -f "$cache" ]; then
+        python3 -c "import json; print(json.load(open('$cache')).get('reset', 0))" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
 }
 
 ping_account() {
@@ -129,36 +148,43 @@ do_swap() {
 renew_loop() {
     local account_name=$1
     local account_creds=$2
-    local renew_file="/tmp/claude-last-renew-${account_name}"
+    local cache_file="/tmp/claude-quota-cache-${account_name}.json"
 
     [ ! -f "$account_creds" ] && return
 
-    # Initialize if first run
-    [ ! -f "$renew_file" ] && echo 0 > "$renew_file"
-
     while true; do
         local now=$(date +%s)
-        local last_renew=$(cat "$renew_file" 2>/dev/null || echo 0)
-        local next_renew=$((last_renew + RENEW_INTERVAL + RENEW_MARGIN))
 
-        if [ $now -ge $next_renew ]; then
-            log "RENEW $account_name: pinging..."
+        # Read REAL reset time from quota cache (updated by statusline every 60s)
+        local reset_at=0
+        if [ -f "$cache_file" ]; then
+            reset_at=$(python3 -c "import json; print(json.load(open('$cache_file')).get('reset', 0))" 2>/dev/null || echo 0)
+        fi
+
+        # Renew = reset_time + 2 min
+        local renew_at=$((reset_at + RENEW_MARGIN))
+
+        if [ $reset_at -gt 0 ] && [ $now -ge $renew_at ]; then
+            local reset_str=$(date -d @$reset_at '+%H:%M' 2>/dev/null || echo "?")
+            log "RENEW $account_name: reset was at $reset_str, pinging..."
             if ping_account "$account_creds"; then
-                date +%s > "$renew_file"
-                local next_time=$(date -d "+${WINDOW_HOURS} hours +2 minutes" '+%H:%M' 2>/dev/null || echo "~5h02")
-                log "RENEW $account_name: OK — next at $next_time"
+                log "RENEW $account_name: OK — waiting for next reset from cache"
             else
                 log "RENEW $account_name: FAILED — retry in ${RENEW_RETRY}s"
                 sleep "$RENEW_RETRY"
                 continue
             fi
+        elif [ $reset_at -gt $now ]; then
+            # Reset in the future — sleep until then + margin
+            local wait=$((renew_at - now))
+            local reset_str=$(date -d @$reset_at '+%H:%M' 2>/dev/null || echo "?")
+            log "RENEW $account_name: next reset at $reset_str, sleeping ${wait}s"
+            sleep "$wait"
+            continue
         fi
 
-        # Sleep until next renew or check every 5 min
-        local wait=$((next_renew - $(date +%s)))
-        [ $wait -le 0 ] && wait=$RENEW_RETRY
-        [ $wait -gt $CHECK_INTERVAL ] && wait=$CHECK_INTERVAL
-        sleep "$wait"
+        # Check every 5 min for cache updates
+        sleep "$CHECK_INTERVAL"
     done
 }
 
@@ -237,19 +263,23 @@ while true; do
         fi
 
     elif [ "$current" = "$FALLBACK_NAME" ]; then
-        # === ON PERSO — wait for indien, swap back ASAP ===
+        # === ON PERSO — wait for indien reset, swap back ASAP ===
 
-        if [ -f "$RATE_LIMITED_AT" ]; then
+        # Read REAL reset time from indien quota cache
+        indien_reset=$(get_reset_time "$PRIMARY_NAME")
+        remaining=0
+        if [ "$indien_reset" -gt 0 ] 2>/dev/null; then
+            remaining=$((indien_reset + RENEW_MARGIN - now))
+        elif [ -f "$RATE_LIMITED_AT" ]; then
             limited_at=$(cat "$RATE_LIMITED_AT")
-            clear_at=$((limited_at + WINDOW_HOURS * 3600))
-            remaining=$((clear_at - now))
+            remaining=$((limited_at + WINDOW_HOURS * 3600 - now))
+        fi
 
-            if [ $remaining -gt 0 ]; then
-                chunk=$CHECK_INTERVAL
-                [ $remaining -lt $chunk ] && chunk=$remaining
-                sleep "$chunk"
-                continue
-            fi
+        if [ $remaining -gt 0 ]; then
+            chunk=$CHECK_INTERVAL
+            [ $remaining -lt $chunk ] && chunk=$remaining
+            sleep "$chunk"
+            continue
         fi
 
         # Test indien

@@ -1,17 +1,20 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# Claude Session Manager — Smart account swap
+# Claude Session Manager
 # ═══════════════════════════════════════════════════════════
 #
-# SIMPLE ALGO:
-# - indien = preferred, always use it when available
-# - perso = safety net, only when indien is rate limited
-# - Monitor indien usage via local session files (zero API cost)
-# - At 95% usage → swap to perso
-# - Periodically check if indien is available again → swap back
-# - NEVER swap FROM perso based on usage (perso has no threshold)
+# 3 FONCTIONS INDEPENDANTES:
 #
-# Claude uses a 5h SLIDING WINDOW. No pings, no renewals.
+# 1. RENEW PERSO: toutes les 5h, ping le compte perso pour
+#    garder sa fenetre active. Tourne TOUJOURS, 24/7,
+#    meme si on est sur indien. Meme la nuit.
+#
+# 2. SWAP indien→perso: quand indien atteint 95% d'usage
+#    (lu depuis les fichiers locaux, zero cout API)
+#
+# 3. SWAP perso→indien: des que indien est dispo apres
+#    son reset (~5h). Indien est TOUJOURS prioritaire.
+#
 # ═══════════════════════════════════════════════════════════
 
 set -u
@@ -25,17 +28,15 @@ FALLBACK_CREDS="$CREDS_DIR/.credentials-${FALLBACK_NAME}.json"
 LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
 RATE_LIMITED_AT="/tmp/claude-rate-limited-at"
+LAST_RENEW_FILE="/tmp/claude-last-renew-perso"
 WINDOW_HOURS=5
-CHECK_INTERVAL=300       # 5 min — read local files (zero cost)
-SWAP_THRESHOLD=95        # Swap indien→perso at this %
-RECOVERY_INTERVAL=1800   # 30 min — check indien via CLI when on perso (costs 1 token)
-RENEW_INTERVAL=18000     # 5h — ping after this much inactivity to start new window
-RENEW_START_HOUR=8       # Don't renew before this hour (avoid wasting window while sleeping)
-RENEW_STOP_HOUR=23       # Don't renew after this hour
+CHECK_INTERVAL=300       # 5 min main loop
+SWAP_THRESHOLD=95        # Auto-swap indien→perso at this %
+RENEW_INTERVAL=18000     # 5h — renew perso every 5h
+RECOVERY_INTERVAL=1800   # 30 min — check indien when on perso
 MAX_FAILS=3
 LONG_RETRY=3600          # 1h after repeated failures
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LAST_ACTIVITY_FILE="/tmp/claude-last-activity"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
@@ -59,17 +60,13 @@ except: print('error')
 }
 
 get_usage_pct() {
-    # Read local session files — ZERO API COST
     python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0"
 }
 
 check_account_via_cli() {
-    # Returns: 0=OK, 1=rate_limited, 2=broken
-    # COSTS ~1 TOKEN — only call when needed
     local creds_file=$1
     [ ! -f "$creds_file" ] && return 2
 
-    # Temporarily swap creds to test
     local backup=$(mktemp)
     cp "$CREDS_FILE" "$backup" 2>/dev/null
     cp "$creds_file" "$CREDS_FILE"
@@ -78,7 +75,6 @@ check_account_via_cli() {
     output=$(echo "ok" | timeout 30 claude -p "reply with just OK" --max-turns 1 2>&1)
     local rc=$?
 
-    # Restore creds
     cp "$backup" "$CREDS_FILE" 2>/dev/null
     rm -f "$backup"
 
@@ -91,48 +87,15 @@ check_account_via_cli() {
     fi
 }
 
-get_last_activity() {
-    # Get timestamp of last Claude Code activity from local session files
-    python3 -c "
-import glob, os, json
-now = __import__('time').time()
-latest = 0
-for f in glob.glob(os.path.expanduser('~/.claude/projects/*/*.jsonl')):
-    try:
-        mtime = os.path.getmtime(f)
-        if mtime > latest: latest = mtime
-    except: pass
-# Also check history.jsonl
-try:
-    h = os.path.getmtime(os.path.expanduser('~/.claude/history.jsonl'))
-    if h > latest: latest = h
-except: pass
-print(int(latest))
-" 2>/dev/null
-}
-
-do_renew() {
-    # Send minimal ping to start a new sliding window
-    log "RENEW: Sending ping to keep session alive..."
-    echo "ok" | timeout 30 claude -p "reply OK" --max-turns 1 >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        log "RENEW: OK — new window started"
-    else
-        log "RENEW: failed (rate limited or broken)"
-    fi
-}
-
 do_swap() {
-    # Swap to target. Checks health first.
     local target_name=$1
     local target_creds="$CREDS_DIR/.credentials-${target_name}.json"
 
     if [ ! -f "$target_creds" ]; then
-        log "ABORT: no credentials for $target_name"
+        log "ABORT swap: no credentials for $target_name"
         return 1
     fi
 
-    # Save current
     local current=$(get_current_account)
     if [ "$current" != "unknown" ] && [ "$current" != "error" ]; then
         cp "$CREDS_FILE" "$CREDS_DIR/.credentials-${current}.json" 2>/dev/null
@@ -144,87 +107,109 @@ do_swap() {
     return 0
 }
 
+do_renew_perso() {
+    # Ping perso to keep its window active — runs 24/7
+    # Temporarily swaps to perso, pings, swaps back
+    log "RENEW PERSO: pinging..."
+
+    local backup=$(mktemp)
+    cp "$CREDS_FILE" "$backup" 2>/dev/null
+    cp "$FALLBACK_CREDS" "$CREDS_FILE" 2>/dev/null
+
+    echo "ok" | timeout 30 claude -p "reply OK" --max-turns 1 >/dev/null 2>&1
+    local rc=$?
+
+    # Save refreshed perso creds
+    cp "$CREDS_FILE" "$FALLBACK_CREDS" 2>/dev/null
+
+    # Restore whatever account was active
+    cp "$backup" "$CREDS_FILE" 2>/dev/null
+    rm -f "$backup"
+
+    date +%s > "$LAST_RENEW_FILE"
+
+    if [ $rc -eq 0 ]; then
+        log "RENEW PERSO: OK"
+    else
+        log "RENEW PERSO: failed"
+    fi
+}
+
 # ═══════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════
 
 log "=== Claude Session Manager started ==="
 
-# Detect mode
 SWAP_ENABLED=false
 if [ -f "$PRIMARY_CREDS" ] && [ -f "$FALLBACK_CREDS" ]; then
     SWAP_ENABLED=true
-    log "SWAP enabled: primary=$PRIMARY_NAME, fallback=$FALLBACK_NAME"
-else
-    log "SWAP disabled (need 2 credential files)"
+    log "SWAP: indien (gratuit) = primary, perso (payant) = fallback"
 fi
-log "RENEW enabled: ping every ${RENEW_INTERVAL}s of inactivity"
+log "RENEW PERSO: every 5h, 24/7"
 
-# Start: try indien first (only if swap enabled)
+# Startup: indien first
 if [ "$SWAP_ENABLED" = true ]; then
     check_account_via_cli "$PRIMARY_CREDS"
     rc=$?
     if [ $rc -eq 0 ]; then
         do_swap "$PRIMARY_NAME"
-        log "Started on $PRIMARY_NAME"
+        log "Started on indien"
     elif [ $rc -eq 1 ]; then
-        log "$PRIMARY_NAME rate limited at startup, using $FALLBACK_NAME"
+        log "Indien rate limited, starting on perso"
         date +%s > "$RATE_LIMITED_AT"
         do_swap "$FALLBACK_NAME"
     else
-        log "$PRIMARY_NAME broken, using $FALLBACK_NAME"
+        log "Indien broken, starting on perso"
         do_swap "$FALLBACK_NAME"
     fi
 fi
 
 fail_count=0
+[ ! -f "$LAST_RENEW_FILE" ] && echo 0 > "$LAST_RENEW_FILE"
 
 # ═══════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════
 
 while true; do
-
-    # ═══════════════════════════════════════════════════════
-    # RENEW — always active, even with 1 account
-    # Ping after RENEW_INTERVAL of inactivity to start new window
-    # ═══════════════════════════════════════════════════════
-    last_activity=$(get_last_activity)
     now=$(date +%s)
-    current_hour=$(date +%H)
-    idle_secs=$((now - last_activity))
 
-    if [ $idle_secs -ge $RENEW_INTERVAL ] && \
-       [ "$current_hour" -ge "$RENEW_START_HOUR" ] && \
-       [ "$current_hour" -lt "$RENEW_STOP_HOUR" ]; then
-        log "IDLE ${idle_secs}s (>= ${RENEW_INTERVAL}s), hour=$current_hour — sending renew ping"
-        do_renew
+    # ─────────────────────────────────────────────────────
+    # 1. RENEW PERSO — always, every 5h, 24/7, no exceptions
+    # ─────────────────────────────────────────────────────
+    last_renew=$(cat "$LAST_RENEW_FILE" 2>/dev/null || echo 0)
+    since_renew=$((now - last_renew))
+
+    if [ $since_renew -ge $RENEW_INTERVAL ]; then
+        do_renew_perso
     fi
 
-    # ═══════════════════════════════════════════════════════
-    # SWAP — only if 2 accounts configured
-    # ═══════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────
+    # 2 & 3. SWAP — only if 2 accounts
+    # ─────────────────────────────────────────────────────
     if [ "$SWAP_ENABLED" = true ]; then
         current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
         if [ "$current" = "$PRIMARY_NAME" ]; then
-            # ─── ON INDIEN: monitor usage (FREE), swap at threshold ───
+            # === ON INDIEN (gratuit) ===
+            # Monitor usage (FREE), swap to perso at 95%
             usage=$(get_usage_pct)
 
             if [ -f "/tmp/claude-request-swap" ]; then
                 rm -f "/tmp/claude-request-swap"
-                log "Manual swap requested (usage: ${usage}%)"
+                log "Manual swap (usage: ${usage}%)"
                 date +%s > "$RATE_LIMITED_AT"
                 do_swap "$FALLBACK_NAME"
             elif [ "$(echo "$usage >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-                log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — swapping to $FALLBACK_NAME"
+                log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — swap to perso"
                 date +%s > "$RATE_LIMITED_AT"
                 do_swap "$FALLBACK_NAME"
             fi
 
         elif [ "$current" = "$FALLBACK_NAME" ]; then
-            # ─── ON PERSO: wait for indien, swap back when clear ───
-            now=$(date +%s)
+            # === ON PERSO (payant) ===
+            # Indien is ALWAYS priority — go back ASAP
 
             if [ -f "$RATE_LIMITED_AT" ]; then
                 limited_at=$(cat "$RATE_LIMITED_AT")
@@ -232,36 +217,37 @@ while true; do
                 remaining=$((clear_at - now))
 
                 if [ $remaining -gt 0 ]; then
-                    log "Sleeping ${remaining}s until $PRIMARY_NAME clears (~$(date -d @$clear_at '+%H:%M' 2>/dev/null || echo "${remaining}s"))"
-                    sleep $remaining
+                    # Don't block — sleep in chunks so renew can fire
+                    chunk=$CHECK_INTERVAL
+                    [ $remaining -lt $chunk ] && chunk=$remaining
+                    sleep "$chunk"
                     continue
                 fi
             fi
 
-            log "Testing $PRIMARY_NAME..."
+            # Window clear — test indien
+            log "Testing indien..."
             check_account_via_cli "$PRIMARY_CREDS"
             rc=$?
 
             if [ $rc -eq 0 ]; then
                 do_swap "$PRIMARY_NAME"
-                log "Back on $PRIMARY_NAME!"
+                log "Back on indien!"
                 fail_count=0
                 rm -f "$RATE_LIMITED_AT"
             elif [ $rc -eq 1 ]; then
-                log "$PRIMARY_NAME still limited, +30min"
+                log "Indien still limited, +30min"
                 date +%s > "$RATE_LIMITED_AT"
-                sleep "$RECOVERY_INTERVAL"
-                continue
             else
                 fail_count=$((fail_count + 1))
                 retry=$RECOVERY_INTERVAL
                 [ $fail_count -ge $MAX_FAILS ] && retry=$LONG_RETRY
-                log "$PRIMARY_NAME broken (#$fail_count), retry ${retry}s"
+                log "Indien broken (#$fail_count), retry ${retry}s"
                 sleep "$retry"
                 continue
             fi
+
         else
-            # Unknown → recover
             check_account_via_cli "$PRIMARY_CREDS"
             if [ $? -eq 0 ]; then
                 do_swap "$PRIMARY_NAME"

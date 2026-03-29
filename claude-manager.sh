@@ -17,7 +17,7 @@
 # 6. Never swap to a broken account
 # ═══════════════════════════════════════════════════════════
 
-set -euo pipefail
+set -u
 
 CREDS_DIR="$HOME/.claude"
 CREDS_FILE="$CREDS_DIR/.credentials.json"

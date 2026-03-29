@@ -35,7 +35,7 @@ SWAP_THRESHOLD=95        # Auto-swap indien→perso at this %
 RENEW_INTERVAL=18000     # 5h
 RENEW_MARGIN=120         # 2 min after window clears
 RENEW_RETRY=120          # 2 min retry on failure
-RECOVERY_INTERVAL=1800   # 30 min — check indien when on perso
+RECOVERY_INTERVAL=300    # 5 min — recheck indien when on perso
 MAX_FAILS=3
 LONG_RETRY=3600
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -293,7 +293,7 @@ while true; do
             fail_count=0
             rm -f "$RATE_LIMITED_AT"
         elif [ $rc -eq 1 ]; then
-            log "Indien still limited, +30min"
+            log "Indien still limited, retry in 5min"
             date +%s > "$RATE_LIMITED_AT"
         else
             fail_count=$((fail_count + 1))

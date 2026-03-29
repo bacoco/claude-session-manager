@@ -19,8 +19,11 @@ set -euo pipefail
 
 CREDS_DIR="$HOME/.claude"
 CREDS_FILE="$CREDS_DIR/.credentials.json"
-INDIEN="$CREDS_DIR/.credentials-indien.json"
-PERSO="$CREDS_DIR/.credentials-perso.json"
+# Account names — configurable via env vars
+PRIMARY_NAME="${CLAUDE_PRIMARY_ACCOUNT:-indien}"
+FALLBACK_NAME="${CLAUDE_FALLBACK_ACCOUNT:-perso}"
+INDIEN="$CREDS_DIR/.credentials-${PRIMARY_NAME}.json"
+PERSO="$CREDS_DIR/.credentials-${FALLBACK_NAME}.json"
 LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
 BLOCK_START_FILE="/tmp/claude-block-start"
@@ -142,15 +145,28 @@ get_block_reset_time() {
 # ── Main ───────────────────────────────────────────────────
 
 log "=== Claude Manager started ==="
-log "Preferred: indien | Fallback: perso"
+
+# Detect mode: dual-account or single-account
+DUAL_MODE=true
+if [ ! -f "$INDIEN" ] || [ ! -f "$PERSO" ]; then
+    DUAL_MODE=false
+    log "SINGLE ACCOUNT MODE (only session renewal, no swap)"
+    log "To enable swap: save creds for both accounts via /swap save"
+else
+    log "DUAL ACCOUNT MODE: Preferred=$PRIMARY_NAME | Fallback=$FALLBACK_NAME"
+fi
 
 # Determine starting account
-if is_account_healthy "$INDIEN" && ! is_rate_limited "$INDIEN"; then
+if [ "$DUAL_MODE" = false ]; then
+    current=$(get_current_account)
+    echo "$current" > "$STATE_FILE"
+    log "Started on $current (single mode)"
+elif is_account_healthy "$INDIEN" && ! is_rate_limited "$INDIEN"; then
     swap_to indien || swap_to perso || log "WARNING: No healthy account!"
-    log "Started on indien"
+    log "Started on $PRIMARY_NAME"
 elif is_account_healthy "$PERSO"; then
     swap_to perso
-    log "Indien unavailable, started on perso"
+    log "$PRIMARY_NAME unavailable, started on $FALLBACK_NAME"
     # If indien is rate limited, estimate when it resets
     if is_rate_limited "$INDIEN"; then
         # Assume current block started ~2.5h ago (worst case middle of block)

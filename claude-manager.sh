@@ -1,20 +1,26 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════
-# Claude Session Manager
+# Claude Session Manager v2.1 — IMMUTABLE ANNUAL TOKENS
 # ═══════════════════════════════════════════════════════════
 #
-# 2 PROCESSUS INDEPENDANTS:
+# TOKENS ANNUELS: ~/.claude/.token-{name}-annual (chmod 444)
+#   → JAMAIS écrasés, JAMAIS copiés, JAMAIS modifiés
+#   → Credentials reconstruits à chaque swap/ping
 #
-# PROCESS 1 — RENEW (background, toujours actif)
-#   - Renew CHAQUE compte independamment, toutes les 5h02
-#   - 24/7, meme la nuit, quel que soit le compte actif
-#   - Si fail (429) → retry toutes les 2 min jusqu'a OK
-#   - Fonctionne avec 1 ou 2 comptes
+# PROCESS 1 — RENEW (2x background)
+#   - Ping chaque compte toutes les 5h (schedule 4:02/9:02/14:02/19:02/0:02)
+#   - Reconstruit les creds depuis le token annuel à chaque ping
+#   - Si fail → retry toutes les 2 min
 #
-# PROCESS 2 — SWAP (foreground, seulement si 2 comptes)
-#   - Indien = prioritaire (gratuit), perso = fallback (payant)
-#   - indien→perso quand usage >= 95%
-#   - perso→indien des que indien est dispo (~5h)
+# PROCESS 2 — SWAP (foreground)
+#   - indien = prioritaire (gratuit), perso = fallback (payant)
+#   - indien→perso quand usage >= 95% (vérifie perso avant)
+#   - perso→indien dès que indien est dispo (vérifie indien avant)
+#   - Lecture cache locale uniquement (zéro token consommé)
+#   - Ping de vérification UNIQUEMENT au moment du swap
+#
+# CONCURRENCE: flock sur /tmp/claude-creds.lock pour éviter
+# les races entre renew loops et swap loop
 #
 # ═══════════════════════════════════════════════════════════
 
@@ -24,20 +30,16 @@ CREDS_DIR="$HOME/.claude"
 CREDS_FILE="$CREDS_DIR/.credentials.json"
 PRIMARY_NAME="${CLAUDE_PRIMARY_ACCOUNT:-indien}"
 FALLBACK_NAME="${CLAUDE_FALLBACK_ACCOUNT:-perso}"
-PRIMARY_CREDS="$CREDS_DIR/.credentials-${PRIMARY_NAME}.json"
-FALLBACK_CREDS="$CREDS_DIR/.credentials-${FALLBACK_NAME}.json"
 LOG="$HOME/.claude-manager.log"
 STATE_FILE="/tmp/claude-account-state"
 RATE_LIMITED_AT="/tmp/claude-rate-limited-at"
-WINDOW_HOURS=5
-CHECK_INTERVAL=300       # 5 min — swap loop
-SWAP_THRESHOLD=95        # Auto-swap indien→perso at this %
-RENEW_INTERVAL=18000     # 5h
-RENEW_MARGIN=120         # 2 min after window clears
-RENEW_RETRY=120          # 2 min retry on failure
-RECOVERY_INTERVAL=300    # 5 min — recheck indien when on perso
-MAX_FAILS=3
-LONG_RETRY=3600
+CLAUDE_BIN="$HOME/.local/bin/claude"
+TOKEN_DIR="$CREDS_DIR"
+LOCK_FILE="/tmp/claude-creds.lock"
+
+CHECK_INTERVAL=300       # 5 min — swap loop check
+SWAP_THRESHOLD=95        # swap indien→perso at this %
+RENEW_RETRY=120          # 2 min retry on ping failure
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 log() {
@@ -45,36 +47,49 @@ log() {
     echo "[$(date '+%H:%M:%S')] $1"
 }
 
+# ═══════════════════════════════════════════════════════════
+# BUILD CREDENTIALS FROM ANNUAL TOKEN
+# This is the ONLY way credentials are created. Never cp.
+# ═══════════════════════════════════════════════════════════
+
+build_creds_json() {
+    local name=$1 output=$2
+    local token_file="$TOKEN_DIR/.token-${name}-annual"
+    [ ! -f "$token_file" ] && { log "ERROR: token file missing: $token_file"; return 1; }
+    local token=$(cat "$token_file")
+    local sub_type="enterprise" tier="default_claude_max_5x"
+    [ "$name" = "perso" ] && { sub_type="max"; tier="default_claude_max_20x"; }
+    python3 << PYEOF
+import json, time, os
+data = {'claudeAiOauth': {
+    'accessToken': '$token',
+    'refreshToken': '',
+    'expiresAt': int((time.time() + 365*24*3600) * 1000),
+    'scopes': ['user:file_upload','user:inference','user:mcp_servers','user:profile','user:sessions:claude_code'],
+    'subscriptionType': '$sub_type',
+    'rateLimitTier': '$tier'
+}}
+with open('$output', 'w') as f:
+    json.dump(data, f)
+os.chmod('$output', 0o600)
+PYEOF
+}
+
 get_current_account() {
-    python3 -c "
-import json
-try:
-    d = json.load(open('$CREDS_FILE'))
-    token = d.get('claudeAiOauth', {}).get('accessToken', '')[:30]
-    for name in ['$PRIMARY_NAME', '$FALLBACK_NAME']:
-        try:
-            t = json.load(open(f'$CREDS_DIR/.credentials-{name}.json')).get('claudeAiOauth', {}).get('accessToken', '')[:30]
-            if token == t: print(name); exit()
-        except: pass
-    print('unknown')
-except: print('error')
-" 2>/dev/null
+    cat "$STATE_FILE" 2>/dev/null || echo "unknown"
 }
 
 get_usage_pct() {
-    # Read from real quota cache (updated by statusline every 60s)
-    local current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+    local current=$(get_current_account)
     local cache="/tmp/claude-quota-cache-${current}.json"
     if [ -f "$cache" ]; then
         python3 -c "import json; print(json.load(open('$cache')).get('util', 0) * 100)" 2>/dev/null || echo "0"
     else
-        # Fallback to session file scanning
-        python3 "$SCRIPT_DIR/check-usage.py" 2>/dev/null || echo "0"
+        echo "0"
     fi
 }
 
 get_reset_time() {
-    # Get real reset timestamp from cache
     local account=$1
     local cache="/tmp/claude-quota-cache-${account}.json"
     if [ -f "$cache" ]; then
@@ -84,107 +99,94 @@ get_reset_time() {
     fi
 }
 
+# ═══════════════════════════════════════════════════════════
+# PING — flock-protected, uses temp creds, never touches backups
+# ═══════════════════════════════════════════════════════════
+
 ping_account() {
-    # Ping an account via CLI. Temporarily swaps creds, pings, restores.
-    # Returns: 0=OK, 1=rate_limited/failed
-    local target_creds=$1
-
-    local backup=$(mktemp)
-    cp "$CREDS_FILE" "$backup" 2>/dev/null
-    cp "$target_creds" "$CREDS_FILE" 2>/dev/null
-
-    echo "ok" | timeout 30 claude -p "reply OK" --max-turns 1 >/dev/null 2>&1
-    local rc=$?
-
-    # Save refreshed creds back to the target file
-    cp "$CREDS_FILE" "$target_creds" 2>/dev/null
-    # Restore active account
-    cp "$backup" "$CREDS_FILE" 2>/dev/null
-    rm -f "$backup"
-
-    return $rc
-}
-
-check_account_via_cli() {
-    # Like ping but returns: 0=OK, 1=rate_limited, 2=broken
-    local creds_file=$1
-    [ ! -f "$creds_file" ] && return 2
-
-    local backup=$(mktemp)
-    cp "$CREDS_FILE" "$backup" 2>/dev/null
-    cp "$creds_file" "$CREDS_FILE"
-
-    local output
-    output=$(echo "ok" | timeout 30 claude -p "reply with just OK" --max-turns 1 2>&1)
-    local rc=$?
-
-    cp "$backup" "$CREDS_FILE" 2>/dev/null
-    rm -f "$backup"
-
-    if [ $rc -eq 0 ]; then return 0
-    elif echo "$output" | grep -qi "rate.limit\|usage.limit\|429\|exceeded"; then return 1
-    else return 2; fi
-}
-
-do_swap() {
     local target_name=$1
-    local target_creds="$CREDS_DIR/.credentials-${target_name}.json"
-    [ ! -f "$target_creds" ] && { log "ABORT swap: no creds for $target_name"; return 1; }
+    (
+        # Acquire lock — prevents races between renew loops and swap
+        flock -w 60 200 || { log "LOCK FAILED for ping $target_name"; exit 1; }
 
-    local current=$(get_current_account)
-    if [ "$current" != "unknown" ] && [ "$current" != "error" ]; then
-        cp "$CREDS_FILE" "$CREDS_DIR/.credentials-${current}.json" 2>/dev/null
-    fi
-    cp "$target_creds" "$CREDS_FILE"
-    echo "$target_name" > "$STATE_FILE"
-    log "SWAP: $current -> $target_name"
+        local backup=$(mktemp)
+        cp "$CREDS_FILE" "$backup" 2>/dev/null
+
+        build_creds_json "$target_name" "$CREDS_FILE" || {
+            cp "$backup" "$CREDS_FILE" 2>/dev/null
+            rm -f "$backup"
+            exit 1
+        }
+
+        echo "ok" | timeout 30 "$CLAUDE_BIN" -p "reply OK" --max-turns 1 >/dev/null 2>&1
+        local rc=$?
+
+        # RESTORE — DISCARD whatever claude refreshed
+        cp "$backup" "$CREDS_FILE" 2>/dev/null
+        rm -f "$backup"
+        exit $rc
+    ) 200>"$LOCK_FILE"
+    return $?
 }
 
 # ═══════════════════════════════════════════════════════════
-# PROCESS 1 — RENEW (runs in background)
-# One independent renew loop per account
+# SWAP — flock-protected, rebuilds creds from annual token
+# ═══════════════════════════════════════════════════════════
+
+do_swap() {
+    local target_name=$1
+    local old=$(get_current_account)
+    (
+        flock -w 60 200 || { log "LOCK FAILED for swap to $target_name"; exit 1; }
+        build_creds_json "$target_name" "$CREDS_FILE" || exit 1
+    ) 200>"$LOCK_FILE"
+    if [ $? -ne 0 ]; then
+        log "ABORT swap: cannot build creds for $target_name"
+        return 1
+    fi
+    echo "$target_name" > "$STATE_FILE"
+    log "SWAP: $old -> $target_name"
+}
+
+# ═══════════════════════════════════════════════════════════
+# PROCESS 1 — RENEW (runs in background, one per account)
+# Schedule: 4:02, 9:02, 14:02, 19:02, 0:02 (every 5h)
 # ═══════════════════════════════════════════════════════════
 
 renew_loop() {
     local account_name=$1
-    local account_creds=$2
-    local cache_file="/tmp/claude-quota-cache-${account_name}.json"
+    local token_file="$TOKEN_DIR/.token-${account_name}-annual"
+    [ ! -f "$token_file" ] && { log "RENEW $account_name: no annual token, exiting"; return; }
 
-    [ ! -f "$account_creds" ] && return
+    local ANCHOR_H=4
+    local ANCHOR_M=2
+    local INTERVAL=18000  # 5h in seconds
 
+    # Find next slot: nearest future (4:02 + N*5h)
+    local now=$(date +%s)
+    local today_anchor=$(date -d "today ${ANCHOR_H}:$(printf '%02d' $ANCHOR_M):00" +%s 2>/dev/null)
+    local target=$today_anchor
+    while [ "$target" -le "$now" ]; do
+        target=$((target + INTERVAL))
+    done
+
+    local target_str=$(date -d @$target '+%H:%M' 2>/dev/null || echo "?")
+    log "RENEW $account_name: schedule 4:02/9:02/14:02/19:02/0:02 — next at $target_str"
+
+    # Initial wait
+    local wait=$((target - $(date +%s)))
+    [ "$wait" -gt 0 ] && sleep "$wait"
+
+    # Ping loop: ping, sleep 5h, repeat. No recalculation.
     while true; do
-        local now=$(date +%s)
-
-        # Read REAL reset time from quota cache (updated by statusline every 60s)
-        local reset_at=0
-        if [ -f "$cache_file" ]; then
-            reset_at=$(python3 -c "import json; print(json.load(open('$cache_file')).get('reset', 0))" 2>/dev/null || echo 0)
+        log "RENEW $account_name: pinging..."
+        if ping_account "$account_name"; then
+            log "RENEW $account_name: OK — next in 5h"
+            sleep $INTERVAL
+        else
+            log "RENEW $account_name: FAILED — retry in ${RENEW_RETRY}s"
+            sleep "$RENEW_RETRY"
         fi
-
-        # Renew = reset_time + 2 min
-        local renew_at=$((reset_at + RENEW_MARGIN))
-
-        if [ $reset_at -gt 0 ] && [ $now -ge $renew_at ]; then
-            local reset_str=$(date -d @$reset_at '+%H:%M' 2>/dev/null || echo "?")
-            log "RENEW $account_name: reset was at $reset_str, pinging..."
-            if ping_account "$account_creds"; then
-                log "RENEW $account_name: OK — waiting for next reset from cache"
-            else
-                log "RENEW $account_name: FAILED — retry in ${RENEW_RETRY}s"
-                sleep "$RENEW_RETRY"
-                continue
-            fi
-        elif [ $reset_at -gt $now ]; then
-            # Reset in the future — sleep until then + margin
-            local wait=$((renew_at - now))
-            local reset_str=$(date -d @$reset_at '+%H:%M' 2>/dev/null || echo "?")
-            log "RENEW $account_name: next reset at $reset_str, sleeping ${wait}s"
-            sleep "$wait"
-            continue
-        fi
-
-        # Check every 5 min for cache updates
-        sleep "$CHECK_INTERVAL"
     done
 }
 
@@ -192,52 +194,45 @@ renew_loop() {
 # MAIN
 # ═══════════════════════════════════════════════════════════
 
-log "=== Claude Session Manager started ==="
+log "=== Claude Session Manager v2.1 started ==="
 
-# Start RENEW loops in background — one per account
+# Verify annual tokens
+for name in "$PRIMARY_NAME" "$FALLBACK_NAME"; do
+    tf="$TOKEN_DIR/.token-${name}-annual"
+    if [ -f "$tf" ]; then
+        log "TOKEN $name: $(wc -c < "$tf") bytes, perms $(stat -c %a "$tf" 2>/dev/null)"
+    else
+        log "TOKEN $name: MISSING — $tf"
+    fi
+done
+
+# Start RENEW loops
 ACCOUNTS_FOUND=0
-for name_creds in "$PRIMARY_NAME:$PRIMARY_CREDS" "$FALLBACK_NAME:$FALLBACK_CREDS"; do
-    acct_name="${name_creds%%:*}"
-    acct_creds="${name_creds##*:}"
-    if [ -f "$acct_creds" ]; then
-        renew_loop "$acct_name" "$acct_creds" &
-        log "RENEW $acct_name: started (PID $!, every 5h02, 24/7)"
+for name in "$PRIMARY_NAME" "$FALLBACK_NAME"; do
+    if [ -f "$TOKEN_DIR/.token-${name}-annual" ]; then
+        renew_loop "$name" &
+        log "RENEW $name: started (PID $!)"
         ACCOUNTS_FOUND=$((ACCOUNTS_FOUND + 1))
     fi
 done
 
-# Determine swap mode
 SWAP_ENABLED=false
 if [ $ACCOUNTS_FOUND -ge 2 ]; then
     SWAP_ENABLED=true
-    log "SWAP: indien (gratuit) = primary, perso (payant) = fallback"
+    log "SWAP: $PRIMARY_NAME (gratuit) = primary, $FALLBACK_NAME (payant) = fallback"
 else
     log "SWAP: disabled ($ACCOUNTS_FOUND account(s))"
 fi
 
-# If no swap, just wait for renew loops
 if [ "$SWAP_ENABLED" = false ]; then
     log "Running renew only. Waiting..."
     wait
     exit 0
 fi
 
-# Startup: indien first
-check_account_via_cli "$PRIMARY_CREDS"
-rc=$?
-if [ $rc -eq 0 ]; then
-    do_swap "$PRIMARY_NAME"
-    log "Started on indien"
-elif [ $rc -eq 1 ]; then
-    log "Indien rate limited, starting on perso"
-    date +%s > "$RATE_LIMITED_AT"
-    do_swap "$FALLBACK_NAME"
-else
-    log "Indien broken, starting on perso"
-    do_swap "$FALLBACK_NAME"
-fi
-
-fail_count=0
+# Startup: indien direct — no test needed (annual token, renew validates)
+do_swap "$PRIMARY_NAME"
+log "Started on $PRIMARY_NAME"
 
 # ═══════════════════════════════════════════════════════════
 # PROCESS 2 — SWAP (foreground loop)
@@ -245,34 +240,41 @@ fail_count=0
 
 while true; do
     now=$(date +%s)
-    current=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+    current=$(get_current_account)
 
     if [ "$current" = "$PRIMARY_NAME" ]; then
-        # === ON INDIEN — monitor usage, swap at 95% ===
+        # === ON INDIEN — monitor usage, swap to perso at 95% ===
         usage=$(get_usage_pct)
 
         if [ -f "/tmp/claude-request-swap" ]; then
             rm -f "/tmp/claude-request-swap"
-            log "Manual swap (usage: ${usage}%)"
-            date +%s > "$RATE_LIMITED_AT"
-            do_swap "$FALLBACK_NAME"
+            log "Manual swap — verifying $FALLBACK_NAME first..."
+            if ping_account "$FALLBACK_NAME"; then
+                date +%s > "$RATE_LIMITED_AT"
+                do_swap "$FALLBACK_NAME"
+            else
+                log "ABORT swap: $FALLBACK_NAME is down, staying on $PRIMARY_NAME"
+            fi
         elif [ "$(echo "$usage >= $SWAP_THRESHOLD" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-            log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — swap to perso"
-            date +%s > "$RATE_LIMITED_AT"
-            do_swap "$FALLBACK_NAME"
+            log "USAGE ${usage}% >= ${SWAP_THRESHOLD}% — verifying $FALLBACK_NAME..."
+            if ping_account "$FALLBACK_NAME"; then
+                do_swap "$FALLBACK_NAME"
+                date +%s > "$RATE_LIMITED_AT"
+                log "Swapped to $FALLBACK_NAME"
+            else
+                log "ABORT swap: $FALLBACK_NAME is down, staying on $PRIMARY_NAME at ${usage}%"
+            fi
         fi
 
     elif [ "$current" = "$FALLBACK_NAME" ]; then
         # === ON PERSO — wait for indien reset, swap back ASAP ===
-
-        # Read REAL reset time from indien quota cache
         indien_reset=$(get_reset_time "$PRIMARY_NAME")
         remaining=0
         if [ "$indien_reset" -gt 0 ] 2>/dev/null; then
-            remaining=$((indien_reset + RENEW_MARGIN - now))
+            remaining=$((indien_reset + 120 - now))
         elif [ -f "$RATE_LIMITED_AT" ]; then
             limited_at=$(cat "$RATE_LIMITED_AT")
-            remaining=$((limited_at + WINDOW_HOURS * 3600 - now))
+            remaining=$((limited_at + 5 * 3600 - now))
         fi
 
         if [ $remaining -gt 0 ]; then
@@ -282,32 +284,30 @@ while true; do
             continue
         fi
 
-        # Test indien
-        log "Testing indien..."
-        check_account_via_cli "$PRIMARY_CREDS"
-        rc=$?
-
-        if [ $rc -eq 0 ]; then
+        # Reset passed — verify indien before swapping back
+        log "Testing $PRIMARY_NAME before swap..."
+        if ping_account "$PRIMARY_NAME"; then
             do_swap "$PRIMARY_NAME"
-            log "Back on indien!"
-            fail_count=0
+            log "Back on $PRIMARY_NAME!"
             rm -f "$RATE_LIMITED_AT"
-        elif [ $rc -eq 1 ]; then
-            log "Indien still limited, retry in 5min"
-            date +%s > "$RATE_LIMITED_AT"
         else
-            fail_count=$((fail_count + 1))
-            retry=$RECOVERY_INTERVAL
-            [ $fail_count -ge $MAX_FAILS ] && retry=$LONG_RETRY
-            log "Indien broken (#$fail_count), retry ${retry}s"
-            sleep "$retry"
+            log "$PRIMARY_NAME failed — retrying in 5min"
+            sleep "$CHECK_INTERVAL"
             continue
         fi
 
     else
-        check_account_via_cli "$PRIMARY_CREDS"
-        if [ $? -eq 0 ]; then do_swap "$PRIMARY_NAME"
-        else do_swap "$FALLBACK_NAME" 2>/dev/null; fi
+        # === UNKNOWN STATE — find best available (indien priority) ===
+        log "Unknown state, finding best available (indien priority)..."
+        if ping_account "$PRIMARY_NAME"; then
+            do_swap "$PRIMARY_NAME"
+            log "Recovered on $PRIMARY_NAME"
+        elif ping_account "$FALLBACK_NAME"; then
+            do_swap "$FALLBACK_NAME"
+            log "Recovered on $FALLBACK_NAME"
+        else
+            log "BOTH accounts down — retry in 5min"
+        fi
     fi
 
     sleep "$CHECK_INTERVAL"
